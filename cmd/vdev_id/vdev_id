@@ -144,6 +144,16 @@ map_channel() {
 	printf "%s" ${MAPPED_CHAN}
 }
 
+map_enclosure() {
+	local ENCLOSURE_SAS_ADDRESS=$1
+	local MAPPED_ENCLOSURE=
+
+	MAPPED_ENCLOSURE=`awk "\\$1 == \"enclosure\" && \\$3 == \"sas_addr=${ENCLOSURE_SAS_ADDRESS}\" \
+		{ print \\$2; exit }" $CONFIG`
+
+	printf "%s" ${MAPPED_ENCLOSURE}
+}
+
 sas_handler() {
 	if [ -z "$PHYS_PER_PORT" ] ; then
 		PHYS_PER_PORT=`awk "\\$1 == \"phys_per_port\" \
@@ -298,12 +308,14 @@ sas_handler() {
 		return
 	fi
 
+	ENCLOSURE_SAS_ADDRESS=`cat $end_device_dir/enclosure_identifier 2>/dev/null`
+	ENCLOSURE=`map_enclosure $ENCLOSURE_SAS_ADDRESS`
 	CHAN=`map_channel $PCI_ID $PORT`
 	SLOT=`map_slot $SLOT $CHAN`
 	if [ -z "$CHAN" ] ; then
 		return
 	fi
-	echo ${CHAN}${SLOT}${PART}
+	echo ${CHAN}${ENCLOSURE}${SLOT}${PART}
 }
 
 scsi_handler() {
