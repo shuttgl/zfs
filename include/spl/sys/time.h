@@ -66,11 +66,20 @@ typedef struct timespec64	inode_timespec_t;
 typedef struct timespec		inode_timespec_t;
 #endif
 
+/* Include for Lustre compatibility */
+#define	timestruc_t	inode_timespec_t
+
 static inline void
 gethrestime(inode_timespec_t *ts)
 {
 #if defined(HAVE_INODE_TIMESPEC64_TIMES)
+
+#if defined(HAVE_KTIME_GET_COARSE_REAL_TS64)
+	ktime_get_coarse_real_ts64(ts);
+#else
 	*ts = current_kernel_time64();
+#endif /* HAVE_KTIME_GET_COARSE_REAL_TS64 */
+
 #else
 	*ts = current_kernel_time();
 #endif
@@ -79,8 +88,17 @@ gethrestime(inode_timespec_t *ts)
 static inline time_t
 gethrestime_sec(void)
 {
-	struct timespec ts;
-	ts = current_kernel_time();
+#if defined(HAVE_INODE_TIMESPEC64_TIMES)
+#if defined(HAVE_KTIME_GET_COARSE_REAL_TS64)
+	inode_timespec_t ts;
+	ktime_get_coarse_real_ts64(&ts);
+#else
+	inode_timespec_t ts = current_kernel_time64();
+#endif  /* HAVE_KTIME_GET_COARSE_REAL_TS64 */
+
+#else
+	inode_timespec_t ts = current_kernel_time();
+#endif
 	return (ts.tv_sec);
 }
 

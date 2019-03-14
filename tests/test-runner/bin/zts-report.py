@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 
 #
 # This file and its contents are supplied under the terms of the
@@ -14,6 +14,8 @@
 #
 # Copyright (c) 2017 by Delphix. All rights reserved.
 # Copyright (c) 2018 by Lawrence Livermore National Security, LLC.
+#
+# This script must remain compatible with Python 2.6+ and Python 3.4+.
 #
 
 import os
@@ -151,8 +153,6 @@ summary = {
 # reasons listed above can be used.
 #
 known = {
-    'acl/posix/posix_001_pos': ['FAIL', known_reason],
-    'acl/posix/posix_002_pos': ['FAIL', known_reason],
     'casenorm/sensitive_none_lookup': ['FAIL', '7633'],
     'casenorm/sensitive_none_delete': ['FAIL', '7633'],
     'casenorm/sensitive_formd_lookup': ['FAIL', '7633'],
@@ -167,7 +167,6 @@ known = {
     'casenorm/mixed_formd_lookup': ['FAIL', '7633'],
     'casenorm/mixed_formd_lookup_ci': ['FAIL', '7633'],
     'casenorm/mixed_formd_delete': ['FAIL', '7633'],
-    'cli_root/zfs_mount/zfs_mount_006_pos': ['SKIP', '4990'],
     'cli_root/zfs_receive/zfs_receive_004_neg': ['FAIL', known_reason],
     'cli_root/zfs_unshare/zfs_unshare_002_pos': ['SKIP', na_reason],
     'cli_root/zfs_unshare/zfs_unshare_006_pos': ['SKIP', na_reason],
@@ -184,6 +183,7 @@ known = {
     'removal/removal_with_zdb': ['SKIP', known_reason],
     'rootpool/setup': ['SKIP', na_reason],
     'rsend/rsend_008_pos': ['SKIP', '6066'],
+    'snapshot/rollback_003_pos': ['SKIP', '6143'],
     'vdev_zaps/vdev_zaps_007_pos': ['FAIL', known_reason],
     'xattr/xattr_008_pos': ['SKIP', na_reason],
     'xattr/xattr_009_neg': ['SKIP', na_reason],
@@ -216,10 +216,6 @@ maybe = {
     'cli_root/zdb/zdb_006_pos': ['FAIL', known_reason],
     'cli_root/zfs_get/zfs_get_004_pos': ['FAIL', known_reason],
     'cli_root/zfs_get/zfs_get_009_pos': ['SKIP', '5479'],
-    'cli_root/zfs_receive/receive-o-x_props_override':
-        ['FAIL', known_reason],
-    'cli_root/zfs_rename/zfs_rename_006_pos': ['FAIL', '5647'],
-    'cli_root/zfs_rename/zfs_rename_009_neg': ['FAIL', '5648'],
     'cli_root/zfs_rollback/zfs_rollback_001_pos': ['FAIL', '6415'],
     'cli_root/zfs_rollback/zfs_rollback_002_pos': ['FAIL', '6416'],
     'cli_root/zfs_share/setup': ['SKIP', share_reason],
@@ -266,6 +262,8 @@ maybe = {
     'rsend/rsend_024_pos': ['FAIL', '5665'],
     'rsend/send-c_volume': ['FAIL', '6087'],
     'snapshot/clone_001_pos': ['FAIL', known_reason],
+    'snapshot/snapshot_009_pos': ['FAIL', '7961'],
+    'snapshot/snapshot_010_pos': ['FAIL', '7961'],
     'snapused/snapused_004_pos': ['FAIL', '5513'],
     'tmpfile/setup': ['SKIP', tmpfile_reason],
     'threadsappend/threadsappend_001_pos': ['FAIL', '6136'],
@@ -279,21 +277,22 @@ maybe = {
 
 
 def usage(s):
-    print s
+    print(s)
     sys.exit(1)
 
 
 def process_results(pathname):
     try:
         f = open(pathname)
-    except IOError, e:
-        print 'Error opening file: %s' % e
+    except IOError as e:
+        print('Error opening file: %s' % e)
         sys.exit(1)
 
     prefix = '/zfs-tests/tests/functional/'
-    pattern = '^Test:\s*\S*%s(\S+)\s*\(run as (\S+)\)\s*\[(\S+)\]\s*\[(\S+)\]'\
+    pattern = \
+        r'^Test:\s*\S*%s(\S+)\s*\(run as (\S+)\)\s*\[(\S+)\]\s*\[(\S+)\]' \
         % prefix
-    pattern_log = '^\s*Log directory:\s*(\S*)'
+    pattern_log = r'^\s*Log directory:\s*(\S*)'
 
     d = {}
     for l in f.readlines():
@@ -313,19 +312,19 @@ def process_results(pathname):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) is not 2:
+    if len(sys.argv) != 2:
         usage('usage: %s <pathname>' % sys.argv[0])
     results = process_results(sys.argv[1])
 
     if summary['total'] == 0:
-        print "\n\nNo test results were found."
-        print "Log directory:  %s" % summary['logfile']
+        print("\n\nNo test results were found.")
+        print("Log directory:  %s" % summary['logfile'])
         sys.exit(0)
 
     expected = []
     unexpected = []
 
-    for test in results.keys():
+    for test in list(results.keys()):
         if results[test] == "PASS":
             continue
 
@@ -342,7 +341,7 @@ if __name__ == "__main__":
         else:
             expected.append(test)
 
-    print "\nTests with results other than PASS that are expected:"
+    print("\nTests with results other than PASS that are expected:")
     for test in sorted(expected):
         issue_url = 'https://github.com/zfsonlinux/zfs/issues/'
 
@@ -368,20 +367,21 @@ if __name__ == "__main__":
             continue
         else:
             expect = "UNKNOWN REASON"
-        print "    %s %s (%s)" % (results[test], test, expect)
+        print("    %s %s (%s)" % (results[test], test, expect))
 
-    print "\nTests with result of PASS that are unexpected:"
+    print("\nTests with result of PASS that are unexpected:")
     for test in sorted(known.keys()):
         # We probably should not be silently ignoring the case
         # where "test" is not in "results".
         if test not in results or results[test] != "PASS":
             continue
-        print "    %s %s (expected %s)" % (results[test], test, known[test][0])
+        print("    %s %s (expected %s)" % (results[test], test,
+                                           known[test][0]))
 
-    print "\nTests with results other than PASS that are unexpected:"
+    print("\nTests with results other than PASS that are unexpected:")
     for test in sorted(unexpected):
         expect = "PASS" if test not in known else known[test][0]
-        print "    %s %s (expected %s)" % (results[test], test, expect)
+        print("    %s %s (expected %s)" % (results[test], test, expect))
 
     if len(unexpected) == 0:
         sys.exit(0)

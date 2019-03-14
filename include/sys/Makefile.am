@@ -20,6 +20,7 @@ COMMON_H = \
 	$(top_srcdir)/include/sys/dmu.h \
 	$(top_srcdir)/include/sys/dmu_impl.h \
 	$(top_srcdir)/include/sys/dmu_objset.h \
+	$(top_srcdir)/include/sys/dmu_recv.h \
 	$(top_srcdir)/include/sys/dmu_send.h \
 	$(top_srcdir)/include/sys/dmu_traverse.h \
 	$(top_srcdir)/include/sys/dmu_tx.h \
@@ -95,6 +96,7 @@ COMMON_H = \
 	$(top_srcdir)/include/sys/vdev_impl.h \
 	$(top_srcdir)/include/sys/vdev_indirect_births.h \
 	$(top_srcdir)/include/sys/vdev_indirect_mapping.h \
+	$(top_srcdir)/include/sys/vdev_initialize.h \
 	$(top_srcdir)/include/sys/vdev_raidz.h \
 	$(top_srcdir)/include/sys/vdev_raidz_impl.h \
 	$(top_srcdir)/include/sys/vdev_removal.h \
@@ -119,6 +121,7 @@ COMMON_H = \
 	$(top_srcdir)/include/sys/zfs_rlock.h \
 	$(top_srcdir)/include/sys/zfs_sa.h \
 	$(top_srcdir)/include/sys/zfs_stat.h \
+	$(top_srcdir)/include/sys/zfs_sysfs.h \
 	$(top_srcdir)/include/sys/zfs_vfsops.h \
 	$(top_srcdir)/include/sys/zfs_vnops.h \
 	$(top_srcdir)/include/sys/zfs_znode.h \

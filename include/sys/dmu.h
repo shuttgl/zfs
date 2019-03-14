@@ -20,12 +20,13 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2011, 2017 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2018 by Delphix. All rights reserved.
  * Copyright 2011 Nexenta Systems, Inc. All rights reserved.
  * Copyright (c) 2012, Joyent, Inc. All rights reserved.
  * Copyright 2014 HybridCluster. All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  * Copyright 2013 Saso Kiselkov. All rights reserved.
+ * Copyright (c) 2017, Intel Corporation.
  */
 
 /* Portions Copyright 2010 Robert Milkowski */
@@ -72,6 +73,7 @@ struct arc_buf;
 struct zio_prop;
 struct sa_handle;
 struct dsl_crypto_params;
+struct locked_range;
 
 typedef struct objset objset_t;
 typedef struct dmu_tx dmu_tx_t;
@@ -135,6 +137,16 @@ typedef enum dmu_object_byteswap {
 #define	DMU_OT_IS_METADATA(ot) (((ot) & DMU_OT_NEWTYPE) ? \
 	((ot) & DMU_OT_METADATA) : \
 	DMU_OT_IS_METADATA_IMPL(ot))
+
+#define	DMU_OT_IS_DDT(ot) \
+	((ot) == DMU_OT_DDT_ZAP)
+
+#define	DMU_OT_IS_ZIL(ot) \
+	((ot) == DMU_OT_INTENT_LOG)
+
+/* Note: ztest uses DMU_OT_UINT64_OTHER as a proxy for file blocks */
+#define	DMU_OT_IS_FILE(ot) \
+	((ot) == DMU_OT_PLAIN_FILE_CONTENTS || (ot) == DMU_OT_UINT64_OTHER)
 
 #define	DMU_OT_IS_ENCRYPTED(ot) (((ot) & DMU_OT_NEWTYPE) ? \
 	((ot) & DMU_OT_ENCRYPTED) : \
@@ -226,7 +238,7 @@ typedef enum dmu_object_type {
 	 * values.
 	 *
 	 * The DMU_OTN_* types do not have entries in the dmu_ot table,
-	 * use the DMU_OT_IS_METDATA() and DMU_OT_BYTESWAP() macros instead
+	 * use the DMU_OT_IS_METADATA() and DMU_OT_BYTESWAP() macros instead
 	 * of indexing into dmu_ot directly (this works for both DMU_OT_* types
 	 * and DMU_OTN_* types).
 	 */
@@ -395,6 +407,10 @@ uint64_t dmu_object_alloc_ibs(objset_t *os, dmu_object_type_t ot, int blocksize,
 uint64_t dmu_object_alloc_dnsize(objset_t *os, dmu_object_type_t ot,
     int blocksize, dmu_object_type_t bonus_type, int bonus_len,
     int dnodesize, dmu_tx_t *tx);
+uint64_t dmu_object_alloc_hold(objset_t *os, dmu_object_type_t ot,
+    int blocksize, int indirect_blockshift, dmu_object_type_t bonustype,
+    int bonuslen, int dnodesize, dnode_t **allocated_dnode, void *tag,
+    dmu_tx_t *tx);
 int dmu_object_claim(objset_t *os, uint64_t object, dmu_object_type_t ot,
     int blocksize, dmu_object_type_t bonus_type, int bonus_len, dmu_tx_t *tx);
 int dmu_object_claim_dnsize(objset_t *os, uint64_t object, dmu_object_type_t ot,
@@ -461,7 +477,8 @@ int dmu_object_set_blocksize(objset_t *os, uint64_t object, uint64_t size,
 
 /*
  * Manually set the maxblkid on a dnode. This will adjust nlevels accordingly
- * to accommodate the change.
+ * to accommodate the change. When calling this function, the caller must
+ * ensure that the object's nlevels can sufficiently support the new maxblkid.
  */
 int dmu_object_set_maxblkid(objset_t *os, uint64_t object, uint64_t maxblkid,
     dmu_tx_t *tx);
@@ -509,9 +526,9 @@ void dmu_write_policy(objset_t *os, dnode_t *dn, int level, int wp,
  *
  * Returns ENOENT, EIO, or 0.
  */
-int dmu_bonus_hold_impl(objset_t *os, uint64_t object, void *tag,
-    uint32_t flags, dmu_buf_t **dbp);
-int dmu_bonus_hold(objset_t *os, uint64_t object, void *tag, dmu_buf_t **);
+int dmu_bonus_hold(objset_t *os, uint64_t object, void *tag, dmu_buf_t **dbp);
+int dmu_bonus_hold_by_dnode(dnode_t *dn, void *tag, dmu_buf_t **dbp,
+    uint32_t flags);
 int dmu_bonus_max(void);
 int dmu_set_bonus(dmu_buf_t *, int, dmu_tx_t *);
 int dmu_set_bonustype(dmu_buf_t *, dmu_object_type_t, dmu_tx_t *);
@@ -724,6 +741,7 @@ struct blkptr *dmu_buf_get_blkptr(dmu_buf_t *db);
  * (ie. you've called dmu_tx_hold_object(tx, db->db_object)).
  */
 void dmu_buf_will_dirty(dmu_buf_t *db, dmu_tx_t *tx);
+boolean_t dmu_buf_is_dirty(dmu_buf_t *db, dmu_tx_t *tx);
 void dmu_buf_set_crypt_params(dmu_buf_t *db_fake, boolean_t byteorder,
     const uint8_t *salt, const uint8_t *iv, const uint8_t *mac, dmu_tx_t *tx);
 
@@ -839,9 +857,9 @@ int dmu_write_uio_dnode(dnode_t *dn, struct uio *uio, uint64_t size,
 #endif
 struct arc_buf *dmu_request_arcbuf(dmu_buf_t *handle, int size);
 void dmu_return_arcbuf(struct arc_buf *buf);
-void dmu_assign_arcbuf_by_dnode(dnode_t *dn, uint64_t offset,
+int dmu_assign_arcbuf_by_dnode(dnode_t *dn, uint64_t offset,
     struct arc_buf *buf, dmu_tx_t *tx);
-void dmu_assign_arcbuf_by_dbuf(dmu_buf_t *handle, uint64_t offset,
+int dmu_assign_arcbuf_by_dbuf(dmu_buf_t *handle, uint64_t offset,
     struct arc_buf *buf, dmu_tx_t *tx);
 #define	dmu_assign_arcbuf	dmu_assign_arcbuf_by_dbuf
 void dmu_copy_from_buf(objset_t *os, uint64_t object, uint64_t offset,
@@ -1023,7 +1041,7 @@ typedef struct zgd {
 	struct lwb	*zgd_lwb;
 	struct blkptr	*zgd_bp;
 	dmu_buf_t	*zgd_db;
-	struct rl	*zgd_rl;
+	struct locked_range *zgd_lr;
 	void		*zgd_private;
 } zgd_t;
 

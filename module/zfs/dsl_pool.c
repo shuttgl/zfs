@@ -83,7 +83,7 @@
  * zfs_dirty_data_max determines the dirty space limit. Once that value is
  * exceeded, new writes are halted until space frees up.
  *
- * The zfs_dirty_data_sync tunable dictates the threshold at which we
+ * The zfs_dirty_data_sync_percent tunable dictates the threshold at which we
  * ensure that there is a txg syncing (see the comment in txg.c for a full
  * description of transaction group stages).
  *
@@ -106,9 +106,11 @@ int zfs_dirty_data_max_percent = 10;
 int zfs_dirty_data_max_max_percent = 25;
 
 /*
- * If there is at least this much dirty data, push out a txg.
+ * If there's at least this much dirty data (as a percentage of
+ * zfs_dirty_data_max), push out a txg.  This should be less than
+ * zfs_vdev_async_write_active_min_dirty_percent.
  */
-unsigned long zfs_dirty_data_sync = 64 * 1024 * 1024;
+int zfs_dirty_data_sync_percent = 20;
 
 /*
  * Once there is this amount of dirty data, the dmu_tx_delay() will kick in
@@ -221,6 +223,9 @@ dsl_pool_open_impl(spa_t *spa, uint64_t txg)
 
 	dp->dp_iput_taskq = taskq_create("z_iput", max_ncpus, defclsyspri,
 	    max_ncpus * 8, INT_MAX, TASKQ_PREPOPULATE | TASKQ_DYNAMIC);
+	dp->dp_unlinked_drain_taskq = taskq_create("z_unlinked_drain",
+	    max_ncpus, defclsyspri, max_ncpus, INT_MAX,
+	    TASKQ_PREPOPULATE | TASKQ_DYNAMIC);
 
 	return (dp);
 }
@@ -411,6 +416,7 @@ dsl_pool_close(dsl_pool_t *dp)
 	rrw_destroy(&dp->dp_config_rwlock);
 	mutex_destroy(&dp->dp_lock);
 	cv_destroy(&dp->dp_spaceavail_cv);
+	taskq_destroy(dp->dp_unlinked_drain_taskq);
 	taskq_destroy(dp->dp_iput_taskq);
 	if (dp->dp_blkstats != NULL) {
 		mutex_destroy(&dp->dp_blkstats->zab_lock);
@@ -455,6 +461,11 @@ dsl_pool_create(spa_t *spa, nvlist_t *zplprops, dsl_crypto_params_t *dcp,
 	int err;
 	dsl_pool_t *dp = dsl_pool_open_impl(spa, txg);
 	dmu_tx_t *tx = dmu_tx_create_assigned(dp, txg);
+#ifdef _KERNEL
+	objset_t *os;
+#else
+	objset_t *os __attribute__((unused));
+#endif
 	dsl_dataset_t *ds;
 	uint64_t obj;
 
@@ -516,18 +527,16 @@ dsl_pool_create(spa_t *spa, nvlist_t *zplprops, dsl_crypto_params_t *dcp,
 	obj = dsl_dataset_create_sync_dd(dp->dp_root_dir, NULL, dcp, 0, tx);
 
 	/* create the root objset */
-	VERIFY0(dsl_dataset_hold_obj(dp, obj, FTAG, &ds));
+	VERIFY0(dsl_dataset_hold_obj_flags(dp, obj,
+	    DS_HOLD_FLAG_DECRYPT, FTAG, &ds));
+	rrw_enter(&ds->ds_bp_rwlock, RW_READER, FTAG);
+	os = dmu_objset_create_impl(dp->dp_spa, ds,
+	    dsl_dataset_get_blkptr(ds), DMU_OST_ZFS, tx);
+	rrw_exit(&ds->ds_bp_rwlock, FTAG);
 #ifdef _KERNEL
-	{
-		objset_t *os;
-		rrw_enter(&ds->ds_bp_rwlock, RW_READER, FTAG);
-		os = dmu_objset_create_impl(dp->dp_spa, ds,
-		    dsl_dataset_get_blkptr(ds), DMU_OST_ZFS, tx);
-		rrw_exit(&ds->ds_bp_rwlock, FTAG);
-		zfs_create_fs(os, kcred, zplprops, tx);
-	}
+	zfs_create_fs(os, kcred, zplprops, tx);
 #endif
-	dsl_dataset_rele(ds, FTAG);
+	dsl_dataset_rele_flags(ds, DS_HOLD_FLAG_DECRYPT, FTAG);
 
 	dmu_tx_commit(tx);
 
@@ -690,9 +699,22 @@ dsl_pool_sync(dsl_pool_t *dp, uint64_t txg)
 	 */
 	zio = zio_root(dp->dp_spa, NULL, NULL, ZIO_FLAG_MUSTSUCCEED);
 	while ((ds = txg_list_remove(&dp->dp_dirty_datasets, txg)) != NULL) {
+		objset_t *os = ds->ds_objset;
+
 		ASSERT(list_link_active(&ds->ds_synced_link));
 		dmu_buf_rele(ds->ds_dbuf, ds);
 		dsl_dataset_sync(ds, zio, tx);
+
+		/*
+		 * Release any key mappings created by calls to
+		 * dsl_dataset_dirty() from the userquota accounting
+		 * code paths.
+		 */
+		if (os->os_encrypted && !os->os_raw_receive &&
+		    !os->os_next_write_raw[txg & TXG_MASK]) {
+			ASSERT3P(ds->ds_key_mapping, !=, NULL);
+			key_mapping_rele(dp->dp_spa, ds->ds_key_mapping, ds);
+		}
 	}
 	VERIFY0(zio_wait(zio));
 
@@ -702,8 +724,17 @@ dsl_pool_sync(dsl_pool_t *dp, uint64_t txg)
 	 *
 	 *  - move dead blocks from the pending deadlist to the on-disk deadlist
 	 *  - release hold from dsl_dataset_dirty()
+	 *  - release key mapping hold from dsl_dataset_dirty()
 	 */
 	while ((ds = list_remove_head(&synced_datasets)) != NULL) {
+		objset_t *os = ds->ds_objset;
+
+		if (os->os_encrypted && !os->os_raw_receive &&
+		    !os->os_next_write_raw[txg & TXG_MASK]) {
+			ASSERT3P(ds->ds_key_mapping, !=, NULL);
+			key_mapping_rele(dp->dp_spa, ds->ds_key_mapping, ds);
+		}
+
 		dsl_dataset_sync_done(ds, tx);
 	}
 
@@ -856,10 +887,12 @@ dsl_pool_need_dirty_delay(dsl_pool_t *dp)
 {
 	uint64_t delay_min_bytes =
 	    zfs_dirty_data_max * zfs_delay_min_dirty_percent / 100;
+	uint64_t dirty_min_bytes =
+	    zfs_dirty_data_max * zfs_dirty_data_sync_percent / 100;
 	boolean_t rv;
 
 	mutex_enter(&dp->dp_lock);
-	if (dp->dp_dirty_total > zfs_dirty_data_sync)
+	if (dp->dp_dirty_total > dirty_min_bytes)
 		txg_kick(dp);
 	rv = (dp->dp_dirty_total > delay_min_bytes);
 	mutex_exit(&dp->dp_lock);
@@ -1066,6 +1099,12 @@ taskq_t *
 dsl_pool_iput_taskq(dsl_pool_t *dp)
 {
 	return (dp->dp_iput_taskq);
+}
+
+taskq_t *
+dsl_pool_unlinked_drain_taskq(dsl_pool_t *dp)
+{
+	return (dp->dp_unlinked_drain_taskq);
 }
 
 /*
@@ -1322,8 +1361,9 @@ module_param(zfs_dirty_data_max_max, ulong, 0444);
 MODULE_PARM_DESC(zfs_dirty_data_max_max,
 	"zfs_dirty_data_max upper bound in bytes");
 
-module_param(zfs_dirty_data_sync, ulong, 0644);
-MODULE_PARM_DESC(zfs_dirty_data_sync, "sync txg when this much dirty data");
+module_param(zfs_dirty_data_sync_percent, int, 0644);
+MODULE_PARM_DESC(zfs_dirty_data_sync_percent,
+	"dirty data txg sync threshold as a percentage of zfs_dirty_data_max");
 
 module_param(zfs_delay_scale, ulong, 0644);
 MODULE_PARM_DESC(zfs_delay_scale, "how quickly delay approaches infinity");

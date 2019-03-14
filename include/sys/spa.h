@@ -20,13 +20,14 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2011, 2014 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2018 by Delphix. All rights reserved.
  * Copyright 2011 Nexenta Systems, Inc.  All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  * Copyright 2013 Saso Kiselkov. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright 2017 Joyent, Inc.
  * Copyright (c) 2017 Datto Inc.
+ * Copyright (c) 2017, Intel Corporation.
  */
 
 #ifndef _SYS_SPA_H
@@ -771,6 +772,7 @@ extern int spa_scan_get_stats(spa_t *spa, pool_scan_stat_t *ps);
 #define	SPA_ASYNC_AUTOEXPAND	0x20
 #define	SPA_ASYNC_REMOVE_DONE	0x40
 #define	SPA_ASYNC_REMOVE_STOP	0x80
+#define	SPA_ASYNC_INITIALIZE_RESTART	0x100
 
 /*
  * Controls the behavior of spa_vdev_remove().
@@ -786,6 +788,8 @@ extern int spa_vdev_detach(spa_t *spa, uint64_t guid, uint64_t pguid,
     int replace_done);
 extern int spa_vdev_remove(spa_t *spa, uint64_t guid, boolean_t unspare);
 extern boolean_t spa_vdev_remove_active(spa_t *spa);
+extern int spa_vdev_initialize(spa_t *spa, nvlist_t *nv, uint64_t cmd_type,
+    nvlist_t *vdev_errlist);
 extern int spa_vdev_setpath(spa_t *spa, uint64_t guid, const char *newpath);
 extern int spa_vdev_setfru(spa_t *spa, uint64_t guid, const char *newfru);
 extern int spa_vdev_split_mirror(spa_t *spa, char *newname, nvlist_t *config,
@@ -862,22 +866,27 @@ extern boolean_t spa_refcount_zero(spa_t *spa);
 #define	SCL_STATE_ALL	(SCL_STATE | SCL_L2ARC | SCL_ZIO)
 
 /* Historical pool statistics */
-typedef struct spa_stats_history {
+typedef struct spa_history_kstat {
 	kmutex_t		lock;
 	uint64_t		count;
 	uint64_t		size;
 	kstat_t			*kstat;
 	void			*private;
 	list_t			list;
-} spa_stats_history_t;
+} spa_history_kstat_t;
+
+typedef struct spa_history_list {
+	uint64_t		size;
+	procfs_list_t		procfs_list;
+} spa_history_list_t;
 
 typedef struct spa_stats {
-	spa_stats_history_t	read_history;
-	spa_stats_history_t	txg_history;
-	spa_stats_history_t	tx_assign_histogram;
-	spa_stats_history_t	io_history;
-	spa_stats_history_t	mmp_history;
-	spa_stats_history_t	state;		/* pool state */
+	spa_history_list_t	read_history;
+	spa_history_list_t	txg_history;
+	spa_history_kstat_t	tx_assign_histogram;
+	spa_history_kstat_t	io_history;
+	spa_history_list_t	mmp_history;
+	spa_history_kstat_t	state;		/* pool state */
 } spa_stats_t;
 
 typedef enum txg_state {
@@ -910,7 +919,7 @@ extern void spa_tx_assign_add_nsecs(spa_t *spa, uint64_t nsecs);
 extern int spa_mmp_history_set_skip(spa_t *spa, uint64_t mmp_kstat_id);
 extern int spa_mmp_history_set(spa_t *spa, uint64_t mmp_kstat_id, int io_error,
     hrtime_t duration);
-extern void *spa_mmp_history_add(spa_t *spa, uint64_t txg, uint64_t timestamp,
+extern void spa_mmp_history_add(spa_t *spa, uint64_t txg, uint64_t timestamp,
     uint64_t mmp_delay, vdev_t *vd, int label, uint64_t mmp_kstat_id,
     int error);
 
@@ -976,6 +985,11 @@ extern uint64_t spa_version(spa_t *spa);
 extern boolean_t spa_deflate(spa_t *spa);
 extern metaslab_class_t *spa_normal_class(spa_t *spa);
 extern metaslab_class_t *spa_log_class(spa_t *spa);
+extern metaslab_class_t *spa_special_class(spa_t *spa);
+extern metaslab_class_t *spa_dedup_class(spa_t *spa);
+extern metaslab_class_t *spa_preferred_class(spa_t *spa, uint64_t size,
+    dmu_object_type_t objtype, uint_t level, uint_t special_smallblk);
+
 extern void spa_evicting_os_register(spa_t *, objset_t *os);
 extern void spa_evicting_os_deregister(spa_t *, objset_t *os);
 extern void spa_evicting_os_wait(spa_t *spa);
@@ -998,7 +1012,6 @@ extern void spa_load_note(spa_t *spa, const char *fmt, ...);
 extern void spa_activate_mos_feature(spa_t *spa, const char *feature,
     dmu_tx_t *tx);
 extern void spa_deactivate_mos_feature(spa_t *spa, const char *feature);
-extern int spa_rename(const char *oldname, const char *newname);
 extern spa_t *spa_by_guid(uint64_t pool_guid, uint64_t device_guid);
 extern boolean_t spa_guid_exists(uint64_t pool_guid, uint64_t device_guid);
 extern char *spa_strdup(const char *);
@@ -1040,6 +1053,7 @@ extern void spa_set_missing_tvds(spa_t *spa, uint64_t missing);
 extern boolean_t spa_top_vdevs_spacemap_addressable(spa_t *spa);
 extern boolean_t spa_multihost(spa_t *spa);
 extern unsigned long spa_get_hostid(void);
+extern void spa_activate_allocation_classes(spa_t *, dmu_tx_t *);
 
 extern int spa_mode(spa_t *spa);
 extern uint64_t zfs_strtonum(const char *str, char **nptr);
@@ -1065,9 +1079,11 @@ extern const char *spa_state_to_name(spa_t *spa);
 /* error handling */
 struct zbookmark_phys;
 extern void spa_log_error(spa_t *spa, const zbookmark_phys_t *zb);
-extern void zfs_ereport_post(const char *class, spa_t *spa, vdev_t *vd,
+extern int zfs_ereport_post(const char *class, spa_t *spa, vdev_t *vd,
     const zbookmark_phys_t *zb, zio_t *zio, uint64_t stateoroffset,
     uint64_t length);
+extern boolean_t zfs_ereport_is_valid(const char *class, spa_t *spa, vdev_t *vd,
+    zio_t *zio);
 extern nvlist_t *zfs_event_create(spa_t *spa, vdev_t *vd, const char *type,
     const char *name, nvlist_t *aux);
 extern void zfs_post_remove(spa_t *spa, vdev_t *vd);

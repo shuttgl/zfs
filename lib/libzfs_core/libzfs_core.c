@@ -20,7 +20,7 @@
  */
 
 /*
- * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright (c) 2013 Steven Hartland. All rights reserved.
  * Copyright (c) 2017 Datto Inc.
  * Copyright 2017 RackTop Systems.
@@ -78,6 +78,9 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef ZFS_DEBUG
+#include <stdio.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -91,6 +94,42 @@ static int g_fd = -1;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_refcount;
 
+#ifdef ZFS_DEBUG
+static zfs_ioc_t fail_ioc_cmd;
+static zfs_errno_t fail_ioc_err;
+
+static void
+libzfs_core_debug_ioc(void)
+{
+	/*
+	 * To test running newer user space binaries with kernel's
+	 * that don't yet support an ioctl or a new ioctl arg we
+	 * provide an override to intentionally fail an ioctl.
+	 *
+	 * USAGE:
+	 * The override variable, ZFS_IOC_TEST, is of the form "cmd:err"
+	 *
+	 * For example, to fail a ZFS_IOC_POOL_CHECKPOINT with a
+	 * ZFS_ERR_IOC_CMD_UNAVAIL, the string would be "0x5a4d:1029"
+	 *
+	 * $ sudo sh -c "ZFS_IOC_TEST=0x5a4d:1029 zpool checkpoint tank"
+	 * cannot checkpoint 'tank': the loaded zfs module does not support
+	 * this operation. A reboot may be required to enable this operation.
+	 */
+	if (fail_ioc_cmd == 0) {
+		char *ioc_test = getenv("ZFS_IOC_TEST");
+		unsigned int ioc_num = 0, ioc_err = 0;
+
+		if (ioc_test != NULL &&
+		    sscanf(ioc_test, "%i:%i", &ioc_num, &ioc_err) == 2 &&
+		    ioc_num < ZFS_IOC_LAST)  {
+			fail_ioc_cmd = ioc_num;
+			fail_ioc_err = ioc_err;
+		}
+	}
+}
+#endif
+
 int
 libzfs_core_init(void)
 {
@@ -103,6 +142,10 @@ libzfs_core_init(void)
 		}
 	}
 	g_refcount++;
+
+#ifdef ZFS_DEBUG
+	libzfs_core_debug_ioc();
+#endif
 	(void) pthread_mutex_unlock(&g_lock);
 	return (0);
 }
@@ -134,6 +177,11 @@ lzc_ioctl(zfs_ioc_t ioc, const char *name,
 
 	ASSERT3S(g_refcount, >, 0);
 	VERIFY3S(g_fd, !=, -1);
+
+#ifdef ZFS_DEBUG
+	if (ioc == fail_ioc_cmd)
+		return (fail_ioc_err);
+#endif
 
 	if (name != NULL)
 		(void) strlcpy(zc.zc_name, name, sizeof (zc.zc_name));
@@ -264,6 +312,30 @@ lzc_remap(const char *fsname)
 	int error;
 	nvlist_t *args = fnvlist_alloc();
 	error = lzc_ioctl(ZFS_IOC_REMAP, fsname, args, NULL);
+	nvlist_free(args);
+	return (error);
+}
+
+int
+lzc_rename(const char *source, const char *target)
+{
+	zfs_cmd_t zc = { "\0" };
+	int error;
+	ASSERT3S(g_refcount, >, 0);
+	VERIFY3S(g_fd, !=, -1);
+	(void) strlcpy(zc.zc_name, source, sizeof (zc.zc_name));
+	(void) strlcpy(zc.zc_value, target, sizeof (zc.zc_value));
+	error = ioctl(g_fd, ZFS_IOC_RENAME, &zc);
+	if (error != 0)
+		error = errno;
+	return (error);
+}
+int
+lzc_destroy(const char *fsname)
+{
+	int error;
+	nvlist_t *args = fnvlist_alloc();
+	error = lzc_ioctl(ZFS_IOC_DESTROY, fsname, args, NULL);
 	nvlist_free(args);
 	return (error);
 }
@@ -1052,6 +1124,7 @@ lzc_bookmark(nvlist_t *bookmarks, nvlist_t **errlist)
  * "guid" - globally unique identifier of the snapshot it refers to
  * "createtxg" - txg when the snapshot it refers to was created
  * "creation" - timestamp when the snapshot it refers to was created
+ * "ivsetguid" - IVset guid for identifying encrypted snapshots
  *
  * The format of the returned nvlist as follows:
  * <short name of bookmark> -> {
@@ -1323,5 +1396,42 @@ lzc_reopen(const char *pool_name, boolean_t scrub_restart)
 
 	error = lzc_ioctl(ZFS_IOC_POOL_REOPEN, pool_name, args, NULL);
 	nvlist_free(args);
+	return (error);
+}
+
+/*
+ * Changes initializing state.
+ *
+ * vdevs should be a list of (<key>, guid) where guid is a uint64 vdev GUID.
+ * The key is ignored.
+ *
+ * If there are errors related to vdev arguments, per-vdev errors are returned
+ * in an nvlist with the key "vdevs". Each error is a (guid, errno) pair where
+ * guid is stringified with PRIu64, and errno is one of the following as
+ * an int64_t:
+ *	- ENODEV if the device was not found
+ *	- EINVAL if the devices is not a leaf or is not concrete (e.g. missing)
+ *	- EROFS if the device is not writeable
+ *	- EBUSY start requested but the device is already being initialized
+ *	- ESRCH cancel/suspend requested but device is not being initialized
+ *
+ * If the errlist is empty, then return value will be:
+ *	- EINVAL if one or more arguments was invalid
+ *	- Other spa_open failures
+ *	- 0 if the operation succeeded
+ */
+int
+lzc_initialize(const char *poolname, pool_initialize_func_t cmd_type,
+    nvlist_t *vdevs, nvlist_t **errlist)
+{
+	int error;
+	nvlist_t *args = fnvlist_alloc();
+	fnvlist_add_uint64(args, ZPOOL_INITIALIZE_COMMAND, (uint64_t)cmd_type);
+	fnvlist_add_nvlist(args, ZPOOL_INITIALIZE_VDEVS, vdevs);
+
+	error = lzc_ioctl(ZFS_IOC_POOL_INITIALIZE, poolname, args, errlist);
+
+	fnvlist_free(args);
+
 	return (error);
 }

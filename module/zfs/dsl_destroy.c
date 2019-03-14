@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright (c) 2013 Steven Hartland. All rights reserved.
  * Copyright (c) 2013 by Joyent, Inc. All rights reserved.
  * Copyright (c) 2016 Actifio, Inc. All rights reserved.
@@ -293,7 +293,7 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 	rrw_enter(&ds->ds_bp_rwlock, RW_READER, FTAG);
 	ASSERT3U(dsl_dataset_phys(ds)->ds_bp.blk_birth, <=, tx->tx_txg);
 	rrw_exit(&ds->ds_bp_rwlock, FTAG);
-	ASSERT(refcount_is_zero(&ds->ds_longholds));
+	ASSERT(zfs_refcount_is_zero(&ds->ds_longholds));
 
 	if (defer &&
 	    (ds->ds_userrefs > 0 ||
@@ -315,10 +315,8 @@ dsl_destroy_snapshot_sync_impl(dsl_dataset_t *ds, boolean_t defer, dmu_tx_t *tx)
 	obj = ds->ds_object;
 
 	for (spa_feature_t f = 0; f < SPA_FEATURES; f++) {
-		if (ds->ds_feature_inuse[f]) {
-			dsl_dataset_deactivate_feature(obj, f, tx);
-			ds->ds_feature_inuse[f] = B_FALSE;
-		}
+		if (dsl_dataset_feature_is_active(ds, f))
+			dsl_dataset_deactivate_feature(ds, f, tx);
 	}
 	if (dsl_dataset_phys(ds)->ds_prev_snap_obj != 0) {
 		ASSERT3P(ds->ds_prev, ==, NULL);
@@ -729,7 +727,7 @@ dsl_destroy_head_check_impl(dsl_dataset_t *ds, int expected_holds)
 	if (ds->ds_is_snapshot)
 		return (SET_ERROR(EINVAL));
 
-	if (refcount_count(&ds->ds_longholds) != expected_holds)
+	if (zfs_refcount_count(&ds->ds_longholds) != expected_holds)
 		return (SET_ERROR(EBUSY));
 
 	mos = ds->ds_dir->dd_pool->dp_meta_objset;
@@ -757,7 +755,7 @@ dsl_destroy_head_check_impl(dsl_dataset_t *ds, int expected_holds)
 	    dsl_dataset_phys(ds->ds_prev)->ds_num_children == 2 &&
 	    ds->ds_prev->ds_userrefs == 0) {
 		/* We need to remove the origin snapshot as well. */
-		if (!refcount_is_zero(&ds->ds_prev->ds_longholds))
+		if (!zfs_refcount_is_zero(&ds->ds_prev->ds_longholds))
 			return (SET_ERROR(EBUSY));
 	}
 	return (0);
@@ -794,14 +792,8 @@ dsl_dir_destroy_sync(uint64_t ddobj, dmu_tx_t *tx)
 
 	ASSERT0(dsl_dir_phys(dd)->dd_head_dataset_obj);
 
-	/*
-	 * Decrement the filesystem count for all parent filesystems.
-	 *
-	 * When we receive an incremental stream into a filesystem that already
-	 * exists, a temporary clone is created.  We never count this temporary
-	 * clone, whose name begins with a '%'.
-	 */
-	if (dd->dd_myname[0] != '%' && dd->dd_parent != NULL)
+	/* Decrement the filesystem count for all parent filesystems. */
+	if (dd->dd_parent != NULL)
 		dsl_fs_ss_count_adjust(dd->dd_parent, -1,
 		    DD_FIELD_FILESYSTEM_COUNT, tx);
 
@@ -823,6 +815,8 @@ dsl_dir_destroy_sync(uint64_t ddobj, dmu_tx_t *tx)
 
 	VERIFY0(zap_destroy(mos, dsl_dir_phys(dd)->dd_child_dir_zapobj, tx));
 	VERIFY0(zap_destroy(mos, dsl_dir_phys(dd)->dd_props_zapobj, tx));
+	if (dsl_dir_phys(dd)->dd_clones != 0)
+		VERIFY0(zap_destroy(mos, dsl_dir_phys(dd)->dd_clones, tx));
 	VERIFY0(dsl_deleg_destroy(mos, dsl_dir_phys(dd)->dd_deleg_zapobj, tx));
 	VERIFY0(zap_remove(mos,
 	    dsl_dir_phys(dd->dd_parent)->dd_child_dir_zapobj,
@@ -867,10 +861,8 @@ dsl_destroy_head_sync_impl(dsl_dataset_t *ds, dmu_tx_t *tx)
 	obj = ds->ds_object;
 
 	for (spa_feature_t f = 0; f < SPA_FEATURES; f++) {
-		if (ds->ds_feature_inuse[f]) {
-			dsl_dataset_deactivate_feature(obj, f, tx);
-			ds->ds_feature_inuse[f] = B_FALSE;
-		}
+		if (dsl_dataset_feature_is_active(ds, f))
+			dsl_dataset_deactivate_feature(ds, f, tx);
 	}
 
 	dsl_scan_ds_destroyed(ds, tx);

@@ -154,6 +154,8 @@ uint32_t zfs_vdev_scrub_min_active = 1;
 uint32_t zfs_vdev_scrub_max_active = 2;
 uint32_t zfs_vdev_removal_min_active = 1;
 uint32_t zfs_vdev_removal_max_active = 2;
+uint32_t zfs_vdev_initializing_min_active = 1;
+uint32_t zfs_vdev_initializing_max_active = 1;
 
 /*
  * When the pool has less than zfs_vdev_async_write_active_min_dirty_percent
@@ -172,6 +174,7 @@ int zfs_vdev_async_write_active_max_dirty_percent = 60;
  * they aren't able to help us aggregate at this level.
  */
 int zfs_vdev_aggregation_limit = 1 << 20;
+int zfs_vdev_aggregation_limit_non_rotating = SPA_OLD_MAXBLOCKSIZE;
 int zfs_vdev_read_gap_limit = 32 << 10;
 int zfs_vdev_write_gap_limit = 4 << 10;
 
@@ -261,6 +264,8 @@ vdev_queue_class_min_active(zio_priority_t p)
 		return (zfs_vdev_scrub_min_active);
 	case ZIO_PRIORITY_REMOVAL:
 		return (zfs_vdev_removal_min_active);
+	case ZIO_PRIORITY_INITIALIZING:
+		return (zfs_vdev_initializing_min_active);
 	default:
 		panic("invalid priority %u", p);
 		return (0);
@@ -331,6 +336,8 @@ vdev_queue_class_max_active(spa_t *spa, zio_priority_t p)
 		return (zfs_vdev_scrub_max_active);
 	case ZIO_PRIORITY_REMOVAL:
 		return (zfs_vdev_removal_max_active);
+	case ZIO_PRIORITY_INITIALIZING:
+		return (zfs_vdev_initializing_max_active);
 	default:
 		panic("invalid priority %u", p);
 		return (0);
@@ -429,16 +436,16 @@ static void
 vdev_queue_io_add(vdev_queue_t *vq, zio_t *zio)
 {
 	spa_t *spa = zio->io_spa;
-	spa_stats_history_t *ssh = &spa->spa_stats.io_history;
+	spa_history_kstat_t *shk = &spa->spa_stats.io_history;
 
 	ASSERT3U(zio->io_priority, <, ZIO_PRIORITY_NUM_QUEUEABLE);
 	avl_add(vdev_queue_class_tree(vq, zio->io_priority), zio);
 	avl_add(vdev_queue_type_tree(vq, zio->io_type), zio);
 
-	if (ssh->kstat != NULL) {
-		mutex_enter(&ssh->lock);
-		kstat_waitq_enter(ssh->kstat->ks_data);
-		mutex_exit(&ssh->lock);
+	if (shk->kstat != NULL) {
+		mutex_enter(&shk->lock);
+		kstat_waitq_enter(shk->kstat->ks_data);
+		mutex_exit(&shk->lock);
 	}
 }
 
@@ -446,16 +453,16 @@ static void
 vdev_queue_io_remove(vdev_queue_t *vq, zio_t *zio)
 {
 	spa_t *spa = zio->io_spa;
-	spa_stats_history_t *ssh = &spa->spa_stats.io_history;
+	spa_history_kstat_t *shk = &spa->spa_stats.io_history;
 
 	ASSERT3U(zio->io_priority, <, ZIO_PRIORITY_NUM_QUEUEABLE);
 	avl_remove(vdev_queue_class_tree(vq, zio->io_priority), zio);
 	avl_remove(vdev_queue_type_tree(vq, zio->io_type), zio);
 
-	if (ssh->kstat != NULL) {
-		mutex_enter(&ssh->lock);
-		kstat_waitq_exit(ssh->kstat->ks_data);
-		mutex_exit(&ssh->lock);
+	if (shk->kstat != NULL) {
+		mutex_enter(&shk->lock);
+		kstat_waitq_exit(shk->kstat->ks_data);
+		mutex_exit(&shk->lock);
 	}
 }
 
@@ -463,17 +470,17 @@ static void
 vdev_queue_pending_add(vdev_queue_t *vq, zio_t *zio)
 {
 	spa_t *spa = zio->io_spa;
-	spa_stats_history_t *ssh = &spa->spa_stats.io_history;
+	spa_history_kstat_t *shk = &spa->spa_stats.io_history;
 
 	ASSERT(MUTEX_HELD(&vq->vq_lock));
 	ASSERT3U(zio->io_priority, <, ZIO_PRIORITY_NUM_QUEUEABLE);
 	vq->vq_class[zio->io_priority].vqc_active++;
 	avl_add(&vq->vq_active_tree, zio);
 
-	if (ssh->kstat != NULL) {
-		mutex_enter(&ssh->lock);
-		kstat_runq_enter(ssh->kstat->ks_data);
-		mutex_exit(&ssh->lock);
+	if (shk->kstat != NULL) {
+		mutex_enter(&shk->lock);
+		kstat_runq_enter(shk->kstat->ks_data);
+		mutex_exit(&shk->lock);
 	}
 }
 
@@ -481,17 +488,17 @@ static void
 vdev_queue_pending_remove(vdev_queue_t *vq, zio_t *zio)
 {
 	spa_t *spa = zio->io_spa;
-	spa_stats_history_t *ssh = &spa->spa_stats.io_history;
+	spa_history_kstat_t *shk = &spa->spa_stats.io_history;
 
 	ASSERT(MUTEX_HELD(&vq->vq_lock));
 	ASSERT3U(zio->io_priority, <, ZIO_PRIORITY_NUM_QUEUEABLE);
 	vq->vq_class[zio->io_priority].vqc_active--;
 	avl_remove(&vq->vq_active_tree, zio);
 
-	if (ssh->kstat != NULL) {
-		kstat_io_t *ksio = ssh->kstat->ks_data;
+	if (shk->kstat != NULL) {
+		kstat_io_t *ksio = shk->kstat->ks_data;
 
-		mutex_enter(&ssh->lock);
+		mutex_enter(&shk->lock);
 		kstat_runq_exit(ksio);
 		if (zio->io_type == ZIO_TYPE_READ) {
 			ksio->reads++;
@@ -500,7 +507,7 @@ vdev_queue_pending_remove(vdev_queue_t *vq, zio_t *zio)
 			ksio->writes++;
 			ksio->nwritten += zio->io_size;
 		}
-		mutex_exit(&ssh->lock);
+		mutex_exit(&shk->lock);
 	}
 }
 
@@ -543,7 +550,11 @@ vdev_queue_aggregate(vdev_queue_t *vq, zio_t *zio)
 	abd_t *abd;
 
 	maxblocksize = spa_maxblocksize(vq->vq_vdev->vdev_spa);
-	limit = MAX(MIN(zfs_vdev_aggregation_limit, maxblocksize), 0);
+	if (vq->vq_vdev->vdev_nonrot)
+		limit = zfs_vdev_aggregation_limit_non_rotating;
+	else
+		limit = zfs_vdev_aggregation_limit;
+	limit = MAX(MIN(limit, maxblocksize), 0);
 
 	if (zio->io_flags & ZIO_FLAG_DONT_AGGREGATE || limit == 0)
 		return (NULL);
@@ -718,8 +729,8 @@ again:
 	}
 
 	/*
-	 * For LBA-ordered queues (async / scrub), issue the i/o which follows
-	 * the most recently issued i/o in LBA (offset) order.
+	 * For LBA-ordered queues (async / scrub / initializing), issue the
+	 * i/o which follows the most recently issued i/o in LBA (offset) order.
 	 *
 	 * For FIFO queues (sync), issue the i/o with the lowest timestamp.
 	 */
@@ -775,13 +786,15 @@ vdev_queue_io(zio_t *zio)
 		if (zio->io_priority != ZIO_PRIORITY_SYNC_READ &&
 		    zio->io_priority != ZIO_PRIORITY_ASYNC_READ &&
 		    zio->io_priority != ZIO_PRIORITY_SCRUB &&
-		    zio->io_priority != ZIO_PRIORITY_REMOVAL)
+		    zio->io_priority != ZIO_PRIORITY_REMOVAL &&
+		    zio->io_priority != ZIO_PRIORITY_INITIALIZING)
 			zio->io_priority = ZIO_PRIORITY_ASYNC_READ;
 	} else {
 		ASSERT(zio->io_type == ZIO_TYPE_WRITE);
 		if (zio->io_priority != ZIO_PRIORITY_SYNC_WRITE &&
 		    zio->io_priority != ZIO_PRIORITY_ASYNC_WRITE &&
-		    zio->io_priority != ZIO_PRIORITY_REMOVAL)
+		    zio->io_priority != ZIO_PRIORITY_REMOVAL &&
+		    zio->io_priority != ZIO_PRIORITY_INITIALIZING)
 			zio->io_priority = ZIO_PRIORITY_ASYNC_WRITE;
 	}
 
@@ -905,6 +918,10 @@ vdev_queue_last_offset(vdev_t *vd)
 module_param(zfs_vdev_aggregation_limit, int, 0644);
 MODULE_PARM_DESC(zfs_vdev_aggregation_limit, "Max vdev I/O aggregation size");
 
+module_param(zfs_vdev_aggregation_limit_non_rotating, int, 0644);
+MODULE_PARM_DESC(zfs_vdev_aggregation_limit_non_rotating,
+	"Max vdev I/O aggregation size for non-rotating media");
+
 module_param(zfs_vdev_read_gap_limit, int, 0644);
 MODULE_PARM_DESC(zfs_vdev_read_gap_limit, "Aggregate read I/O over gap");
 
@@ -938,11 +955,29 @@ module_param(zfs_vdev_async_write_min_active, int, 0644);
 MODULE_PARM_DESC(zfs_vdev_async_write_min_active,
 	"Min active async write I/Os per vdev");
 
+module_param(zfs_vdev_initializing_max_active, int, 0644);
+MODULE_PARM_DESC(zfs_vdev_initializing_max_active,
+	"Max active initializing I/Os per vdev");
+
+module_param(zfs_vdev_initializing_min_active, int, 0644);
+MODULE_PARM_DESC(zfs_vdev_initializing_min_active,
+	"Min active initializing I/Os per vdev");
+
+module_param(zfs_vdev_removal_max_active, int, 0644);
+MODULE_PARM_DESC(zfs_vdev_removal_max_active,
+	"Max active removal I/Os per vdev");
+
+module_param(zfs_vdev_removal_min_active, int, 0644);
+MODULE_PARM_DESC(zfs_vdev_removal_min_active,
+	"Min active removal I/Os per vdev");
+
 module_param(zfs_vdev_scrub_max_active, int, 0644);
-MODULE_PARM_DESC(zfs_vdev_scrub_max_active, "Max active scrub I/Os per vdev");
+MODULE_PARM_DESC(zfs_vdev_scrub_max_active,
+	"Max active scrub I/Os per vdev");
 
 module_param(zfs_vdev_scrub_min_active, int, 0644);
-MODULE_PARM_DESC(zfs_vdev_scrub_min_active, "Min active scrub I/Os per vdev");
+MODULE_PARM_DESC(zfs_vdev_scrub_min_active,
+	"Min active scrub I/Os per vdev");
 
 module_param(zfs_vdev_sync_read_max_active, int, 0644);
 MODULE_PARM_DESC(zfs_vdev_sync_read_max_active,

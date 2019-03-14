@@ -106,6 +106,7 @@ typedef enum drr_headertype {
 #define	DMU_BACKUP_FEATURE_LARGE_DNODE		(1 << 23)
 #define	DMU_BACKUP_FEATURE_RAW			(1 << 24)
 /* flag #25 is reserved for the ZSTD compression feature */
+#define	DMU_BACKUP_FEATURE_HOLDS		(1 << 26)
 
 /*
  * Mask of all supported backup features
@@ -115,7 +116,7 @@ typedef enum drr_headertype {
     DMU_BACKUP_FEATURE_EMBED_DATA | DMU_BACKUP_FEATURE_LZ4 | \
     DMU_BACKUP_FEATURE_RESUMING | DMU_BACKUP_FEATURE_LARGE_BLOCKS | \
     DMU_BACKUP_FEATURE_COMPRESSED | DMU_BACKUP_FEATURE_LARGE_DNODE | \
-    DMU_BACKUP_FEATURE_RAW)
+    DMU_BACKUP_FEATURE_RAW | DMU_BACKUP_FEATURE_HOLDS)
 
 /* Are all features in the given flag word currently supported? */
 #define	DMU_STREAM_SUPPORTED(x)	(!((x) & ~DMU_BACKUP_FEATURE_MASK))
@@ -372,6 +373,7 @@ typedef struct zinject_record {
 #define	ZINJECT_NULL		0x1
 #define	ZINJECT_FLUSH_ARC	0x2
 #define	ZINJECT_UNLOAD_SPA	0x4
+#define	ZINJECT_CALC_RANGE	0x8
 
 #define	ZEVENT_NONE		0x0
 #define	ZEVENT_NONBLOCK		0x1

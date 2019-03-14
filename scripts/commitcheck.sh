@@ -69,10 +69,10 @@ function new_change_commit()
 {
     error=0
 
-    # subject is not longer than 50 characters
-    long_subject=$(git log -n 1 --pretty=%s "$REF" | grep -E -m 1 '.{51}')
+    # subject is not longer than 72 characters
+    long_subject=$(git log -n 1 --pretty=%s "$REF" | grep -E -m 1 '.{73}')
     if [ -n "$long_subject" ]; then
-        echo "error: commit subject over 50 characters"
+        echo "error: commit subject over 72 characters"
         error=1
     fi
 
@@ -118,11 +118,6 @@ function openzfs_port_commit()
 
     # need a reviewed by line
     if ! check_tagged_line "Reviewed by" ; then
-        error=1
-    fi
-
-    # need a approved by line
-    if ! check_tagged_line "Approved by" ; then
         error=1
     fi
 

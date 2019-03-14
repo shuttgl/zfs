@@ -158,11 +158,6 @@ enum zio_encrypt {
 	(compress) == ZIO_COMPRESS_ON ||		\
 	(compress) == ZIO_COMPRESS_OFF)
 
-/*
- * Default Linux timeout for a sd device.
- */
-#define	ZIO_DELAY_MAX			(30 * MILLISEC)
-
 #define	ZIO_FAILURE_MODE_WAIT		0
 #define	ZIO_FAILURE_MODE_CONTINUE	1
 #define	ZIO_FAILURE_MODE_PANIC		2
@@ -353,6 +348,7 @@ typedef struct zio_prop {
 	uint8_t			zp_salt[ZIO_DATA_SALT_LEN];
 	uint8_t			zp_iv[ZIO_DATA_IV_LEN];
 	uint8_t			zp_mac[ZIO_DATA_MAC_LEN];
+	uint32_t		zp_zpl_smallblk;
 } zio_prop_t;
 
 typedef struct zio_cksum_report zio_cksum_report_t;
@@ -473,6 +469,7 @@ struct zio {
 	vdev_t		*io_vd;
 	void		*io_vsd;
 	const zio_vsd_ops_t *io_vsd_ops;
+	metaslab_class_t *io_metaslab_class;	/* dva throttle class */
 
 	uint64_t	io_offset;
 	hrtime_t	io_timestamp;	/* submitted at */
@@ -662,7 +659,7 @@ extern void zfs_ereport_finish_checksum(zio_cksum_report_t *report,
 extern void zfs_ereport_free_checksum(zio_cksum_report_t *report);
 
 /* If we have the good data in hand, this function can be used */
-extern void zfs_ereport_post_checksum(spa_t *spa, vdev_t *vd,
+extern int zfs_ereport_post_checksum(spa_t *spa, vdev_t *vd,
     const zbookmark_phys_t *zb, struct zio *zio, uint64_t offset,
     uint64_t length, const abd_t *good_data, const abd_t *bad_data,
     struct zio_bad_cksum *info);

@@ -15,6 +15,7 @@
 
 /*
  * Copyright (c) 2017, Datto, Inc. All rights reserved.
+ * Copyright (c) 2018 by Delphix. All rights reserved.
  */
 
 #include <sys/dsl_crypt.h>
@@ -71,22 +72,29 @@
  * object is also refcounted.
  */
 
+/*
+ * This tunable allows datasets to be raw received even if the stream does
+ * not include IVset guids or if the guids don't match. This is used as part
+ * of the resolution for ZPOOL_ERRATA_ZOL_8308_ENCRYPTION.
+ */
+int zfs_disable_ivset_guid_check = 0;
+
 static void
 dsl_wrapping_key_hold(dsl_wrapping_key_t *wkey, void *tag)
 {
-	(void) refcount_add(&wkey->wk_refcnt, tag);
+	(void) zfs_refcount_add(&wkey->wk_refcnt, tag);
 }
 
 static void
 dsl_wrapping_key_rele(dsl_wrapping_key_t *wkey, void *tag)
 {
-	(void) refcount_remove(&wkey->wk_refcnt, tag);
+	(void) zfs_refcount_remove(&wkey->wk_refcnt, tag);
 }
 
 static void
 dsl_wrapping_key_free(dsl_wrapping_key_t *wkey)
 {
-	ASSERT0(refcount_count(&wkey->wk_refcnt));
+	ASSERT0(zfs_refcount_count(&wkey->wk_refcnt));
 
 	if (wkey->wk_key.ck_data) {
 		bzero(wkey->wk_key.ck_data,
@@ -95,7 +103,7 @@ dsl_wrapping_key_free(dsl_wrapping_key_t *wkey)
 		    CRYPTO_BITS2BYTES(wkey->wk_key.ck_length));
 	}
 
-	refcount_destroy(&wkey->wk_refcnt);
+	zfs_refcount_destroy(&wkey->wk_refcnt);
 	kmem_free(wkey, sizeof (dsl_wrapping_key_t));
 }
 
@@ -123,7 +131,7 @@ dsl_wrapping_key_create(uint8_t *wkeydata, zfs_keyformat_t keyformat,
 	bcopy(wkeydata, wkey->wk_key.ck_data, WRAPPING_KEY_LEN);
 
 	/* initialize the rest of the struct */
-	refcount_create(&wkey->wk_refcnt);
+	zfs_refcount_create(&wkey->wk_refcnt);
 	wkey->wk_keyformat = keyformat;
 	wkey->wk_salt = salt;
 	wkey->wk_iters = iters;
@@ -518,13 +526,13 @@ out:
 static void
 dsl_crypto_key_free(dsl_crypto_key_t *dck)
 {
-	ASSERT(refcount_count(&dck->dck_holds) == 0);
+	ASSERT(zfs_refcount_count(&dck->dck_holds) == 0);
 
 	/* destroy the zio_crypt_key_t */
 	zio_crypt_key_destroy(&dck->dck_key);
 
 	/* free the refcount, wrapping key, and lock */
-	refcount_destroy(&dck->dck_holds);
+	zfs_refcount_destroy(&dck->dck_holds);
 	if (dck->dck_wkey)
 		dsl_wrapping_key_rele(dck->dck_wkey, dck);
 
@@ -535,7 +543,7 @@ dsl_crypto_key_free(dsl_crypto_key_t *dck)
 static void
 dsl_crypto_key_rele(dsl_crypto_key_t *dck, void *tag)
 {
-	if (refcount_remove(&dck->dck_holds, tag) == 0)
+	if (zfs_refcount_remove(&dck->dck_holds, tag) == 0)
 		dsl_crypto_key_free(dck);
 }
 
@@ -601,11 +609,11 @@ dsl_crypto_key_open(objset_t *mos, dsl_wrapping_key_t *wkey,
 	}
 
 	/* finish initializing the dsl_crypto_key_t */
-	refcount_create(&dck->dck_holds);
+	zfs_refcount_create(&dck->dck_holds);
 	dsl_wrapping_key_hold(wkey, dck);
 	dck->dck_wkey = wkey;
 	dck->dck_obj = dckobj;
-	refcount_add(&dck->dck_holds, tag);
+	zfs_refcount_add(&dck->dck_holds, tag);
 
 	*dck_out = dck;
 	return (0);
@@ -641,7 +649,7 @@ spa_keystore_dsl_key_hold_impl(spa_t *spa, uint64_t dckobj, void *tag,
 	}
 
 	/* increment the refcount */
-	refcount_add(&found_dck->dck_holds, tag);
+	zfs_refcount_add(&found_dck->dck_holds, tag);
 
 	*dck_out = found_dck;
 	return (0);
@@ -714,7 +722,7 @@ spa_keystore_dsl_key_rele(spa_t *spa, dsl_crypto_key_t *dck, void *tag)
 {
 	rw_enter(&spa->spa_keystore.sk_dk_lock, RW_WRITER);
 
-	if (refcount_remove(&dck->dck_holds, tag) == 0) {
+	if (zfs_refcount_remove(&dck->dck_holds, tag) == 0) {
 		avl_remove(&spa->spa_keystore.sk_dsl_keys, dck);
 		dsl_crypto_key_free(dck);
 	}
@@ -757,7 +765,7 @@ spa_keystore_load_wkey(const char *dsname, dsl_crypto_params_t *dcp,
 	dsl_crypto_key_t *dck = NULL;
 	dsl_wrapping_key_t *wkey = dcp->cp_wkey;
 	dsl_pool_t *dp = NULL;
-	uint64_t keyformat, salt, iters;
+	uint64_t rddobj, keyformat, salt, iters;
 
 	/*
 	 * We don't validate the wrapping key's keyformat, salt, or iters
@@ -774,7 +782,7 @@ spa_keystore_load_wkey(const char *dsname, dsl_crypto_params_t *dcp,
 		goto error;
 
 	if (!spa_feature_is_enabled(dp->dp_spa, SPA_FEATURE_ENCRYPTION)) {
-		ret = (SET_ERROR(ENOTSUP));
+		ret = SET_ERROR(ENOTSUP);
 		goto error;
 	}
 
@@ -782,6 +790,13 @@ spa_keystore_load_wkey(const char *dsname, dsl_crypto_params_t *dcp,
 	ret = dsl_dir_hold(dp, dsname, FTAG, &dd, NULL);
 	if (ret != 0) {
 		dd = NULL;
+		goto error;
+	}
+
+	/* confirm that dd is the encryption root */
+	ret = dsl_dir_get_encryption_root_ddobj(dd, &rddobj);
+	if (ret != 0 || rddobj != dd->dd_object) {
+		ret = SET_ERROR(EINVAL);
 		goto error;
 	}
 
@@ -872,7 +887,7 @@ spa_keystore_unload_wkey_impl(spa_t *spa, uint64_t ddobj)
 	if (!found_wkey) {
 		ret = SET_ERROR(EACCES);
 		goto error_unlock;
-	} else if (refcount_count(&found_wkey->wk_refcnt) != 0) {
+	} else if (zfs_refcount_count(&found_wkey->wk_refcnt) != 0) {
 		ret = SET_ERROR(EBUSY);
 		goto error_unlock;
 	}
@@ -896,6 +911,20 @@ spa_keystore_unload_wkey(const char *dsname)
 	int ret = 0;
 	dsl_dir_t *dd = NULL;
 	dsl_pool_t *dp = NULL;
+	spa_t *spa = NULL;
+
+	ret = spa_open(dsname, &spa, FTAG);
+	if (ret != 0)
+		return (ret);
+
+	/*
+	 * Wait for any outstanding txg IO to complete, releasing any
+	 * remaining references on the wkey.
+	 */
+	if (spa_mode(spa) != FREAD)
+		txg_wait_synced(spa->spa_dsl_pool, 0);
+
+	spa_close(spa, FTAG);
 
 	/* hold the dsl dir */
 	ret = dsl_pool_hold(dsname, FTAG, &dp);
@@ -935,9 +964,56 @@ error:
 	return (ret);
 }
 
+void
+key_mapping_add_ref(dsl_key_mapping_t *km, void *tag)
+{
+	ASSERT3U(zfs_refcount_count(&km->km_refcnt), >=, 1);
+	zfs_refcount_add(&km->km_refcnt, tag);
+}
+
+/*
+ * The locking here is a little tricky to ensure we don't cause unnecessary
+ * performance problems. We want to release a key mapping whenever someone
+ * decrements the refcount to 0, but freeing the mapping requires removing
+ * it from the spa_keystore, which requires holding sk_km_lock as a writer.
+ * Most of the time we don't want to hold this lock as a writer, since the
+ * same lock is held as a reader for each IO that needs to encrypt / decrypt
+ * data for any dataset and in practice we will only actually free the
+ * mapping after unmounting a dataset.
+ */
+void
+key_mapping_rele(spa_t *spa, dsl_key_mapping_t *km, void *tag)
+{
+	ASSERT3U(zfs_refcount_count(&km->km_refcnt), >=, 1);
+
+	if (zfs_refcount_remove(&km->km_refcnt, tag) != 0)
+		return;
+
+	/*
+	 * We think we are going to need to free the mapping. Add a
+	 * reference to prevent most other releasers from thinking
+	 * this might be their responsibility. This is inherently
+	 * racy, so we will confirm that we are legitimately the
+	 * last holder once we have the sk_km_lock as a writer.
+	 */
+	zfs_refcount_add(&km->km_refcnt, FTAG);
+
+	rw_enter(&spa->spa_keystore.sk_km_lock, RW_WRITER);
+	if (zfs_refcount_remove(&km->km_refcnt, FTAG) != 0) {
+		rw_exit(&spa->spa_keystore.sk_km_lock);
+		return;
+	}
+
+	avl_remove(&spa->spa_keystore.sk_key_mappings, km);
+	rw_exit(&spa->spa_keystore.sk_km_lock);
+
+	spa_keystore_dsl_key_rele(spa, km->km_key, km);
+	kmem_free(km, sizeof (dsl_key_mapping_t));
+}
+
 int
-spa_keystore_create_mapping_impl(spa_t *spa, uint64_t dsobj,
-    dsl_dir_t *dd, void *tag)
+spa_keystore_create_mapping(spa_t *spa, dsl_dataset_t *ds, void *tag,
+    dsl_key_mapping_t **km_out)
 {
 	int ret;
 	avl_index_t where;
@@ -946,16 +1022,19 @@ spa_keystore_create_mapping_impl(spa_t *spa, uint64_t dsobj,
 
 	/* Allocate and initialize the mapping */
 	km = kmem_zalloc(sizeof (dsl_key_mapping_t), KM_SLEEP);
-	refcount_create(&km->km_refcnt);
+	zfs_refcount_create(&km->km_refcnt);
 
-	ret = spa_keystore_dsl_key_hold_dd(spa, dd, km, &km->km_key);
+	ret = spa_keystore_dsl_key_hold_dd(spa, ds->ds_dir, km, &km->km_key);
 	if (ret != 0) {
-		refcount_destroy(&km->km_refcnt);
+		zfs_refcount_destroy(&km->km_refcnt);
 		kmem_free(km, sizeof (dsl_key_mapping_t));
+
+		if (km_out != NULL)
+			*km_out = NULL;
 		return (ret);
 	}
 
-	km->km_dsobj = dsobj;
+	km->km_dsobj = ds->ds_object;
 
 	rw_enter(&spa->spa_keystore.sk_km_lock, RW_WRITER);
 
@@ -970,28 +1049,25 @@ spa_keystore_create_mapping_impl(spa_t *spa, uint64_t dsobj,
 	found_km = avl_find(&spa->spa_keystore.sk_key_mappings, km, &where);
 	if (found_km != NULL) {
 		should_free = B_TRUE;
-		refcount_add(&found_km->km_refcnt, tag);
+		zfs_refcount_add(&found_km->km_refcnt, tag);
+		if (km_out != NULL)
+			*km_out = found_km;
 	} else {
-		refcount_add(&km->km_refcnt, tag);
+		zfs_refcount_add(&km->km_refcnt, tag);
 		avl_insert(&spa->spa_keystore.sk_key_mappings, km, where);
+		if (km_out != NULL)
+			*km_out = km;
 	}
 
 	rw_exit(&spa->spa_keystore.sk_km_lock);
 
 	if (should_free) {
 		spa_keystore_dsl_key_rele(spa, km->km_key, km);
-		refcount_destroy(&km->km_refcnt);
+		zfs_refcount_destroy(&km->km_refcnt);
 		kmem_free(km, sizeof (dsl_key_mapping_t));
 	}
 
 	return (0);
-}
-
-int
-spa_keystore_create_mapping(spa_t *spa, dsl_dataset_t *ds, void *tag)
-{
-	return (spa_keystore_create_mapping_impl(spa, ds->ds_object,
-	    ds->ds_dir, tag));
 }
 
 int
@@ -1000,12 +1076,11 @@ spa_keystore_remove_mapping(spa_t *spa, uint64_t dsobj, void *tag)
 	int ret;
 	dsl_key_mapping_t search_km;
 	dsl_key_mapping_t *found_km;
-	boolean_t should_free = B_FALSE;
 
 	/* init the search key mapping */
 	search_km.km_dsobj = dsobj;
 
-	rw_enter(&spa->spa_keystore.sk_km_lock, RW_WRITER);
+	rw_enter(&spa->spa_keystore.sk_km_lock, RW_READER);
 
 	/* find the matching mapping */
 	found_km = avl_find(&spa->spa_keystore.sk_key_mappings,
@@ -1015,23 +1090,9 @@ spa_keystore_remove_mapping(spa_t *spa, uint64_t dsobj, void *tag)
 		goto error_unlock;
 	}
 
-	/*
-	 * Decrement the refcount on the mapping and remove it from the tree if
-	 * it is zero. Try to minimize time spent in this lock by deferring
-	 * cleanup work.
-	 */
-	if (refcount_remove(&found_km->km_refcnt, tag) == 0) {
-		should_free = B_TRUE;
-		avl_remove(&spa->spa_keystore.sk_key_mappings, found_km);
-	}
-
 	rw_exit(&spa->spa_keystore.sk_km_lock);
 
-	/* destroy the key mapping */
-	if (should_free) {
-		spa_keystore_dsl_key_rele(spa, found_km->km_key, found_km);
-		kmem_free(found_km, sizeof (dsl_key_mapping_t));
-	}
+	key_mapping_rele(spa, found_km, tag);
 
 	return (0);
 
@@ -1072,7 +1133,7 @@ spa_keystore_lookup_key(spa_t *spa, uint64_t dsobj, void *tag,
 	}
 
 	if (found_km && tag)
-		refcount_add(&found_km->km_key->dck_holds, tag);
+		zfs_refcount_add(&found_km->km_key->dck_holds, tag);
 
 	rw_exit(&spa->spa_keystore.sk_km_lock);
 
@@ -1506,7 +1567,7 @@ spa_keystore_change_key_sync(void *arg, dmu_tx_t *tx)
 	wkey_search.wk_ddobj = ds->ds_dir->dd_object;
 	found_wkey = avl_find(&spa->spa_keystore.sk_wkeys, &wkey_search, NULL);
 	if (found_wkey != NULL) {
-		ASSERT0(refcount_count(&found_wkey->wk_refcnt));
+		ASSERT0(zfs_refcount_count(&found_wkey->wk_refcnt));
 		avl_remove(&spa->spa_keystore.sk_wkeys, found_wkey);
 		dsl_wrapping_key_free(found_wkey);
 	}
@@ -1892,7 +1953,8 @@ dsl_dataset_create_crypt_sync(uint64_t dsobj, dsl_dir_t *dd,
 	VERIFY0(zap_add(dp->dp_meta_objset, dd->dd_object,
 	    DD_FIELD_CRYPTO_KEY_OBJ, sizeof (uint64_t), 1, &dd->dd_crypto_obj,
 	    tx));
-	dsl_dataset_activate_feature(dsobj, SPA_FEATURE_ENCRYPTION, tx);
+	dsl_dataset_activate_feature(dsobj, SPA_FEATURE_ENCRYPTION,
+	    (void *)B_TRUE, tx);
 
 	/*
 	 * If we inherited the wrapping key we release our reference now.
@@ -1908,21 +1970,23 @@ dsl_dataset_create_crypt_sync(uint64_t dsobj, dsl_dir_t *dd,
 
 typedef struct dsl_crypto_recv_key_arg {
 	uint64_t dcrka_dsobj;
+	uint64_t dcrka_fromobj;
 	dmu_objset_type_t dcrka_ostype;
 	nvlist_t *dcrka_nvl;
 	boolean_t dcrka_do_key;
 } dsl_crypto_recv_key_arg_t;
 
 static int
-dsl_crypto_recv_raw_objset_check(dsl_dataset_t *ds, dmu_objset_type_t ostype,
-    nvlist_t *nvl, dmu_tx_t *tx)
+dsl_crypto_recv_raw_objset_check(dsl_dataset_t *ds, dsl_dataset_t *fromds,
+    dmu_objset_type_t ostype, nvlist_t *nvl, dmu_tx_t *tx)
 {
 	int ret;
 	objset_t *os;
 	dnode_t *mdn;
 	uint8_t *buf = NULL;
 	uint_t len;
-	uint64_t intval, nlevels, blksz, ibs, nblkptr, maxblkid;
+	uint64_t intval, nlevels, blksz, ibs;
+	uint64_t nblkptr, maxblkid;
 
 	if (ostype != DMU_OST_ZFS && ostype != DMU_OST_ZVOL)
 		return (SET_ERROR(EINVAL));
@@ -1989,6 +2053,30 @@ dsl_crypto_recv_raw_objset_check(dsl_dataset_t *ds, dmu_objset_type_t ostype,
 	}
 	rrw_exit(&ds->ds_bp_rwlock, FTAG);
 
+	/*
+	 * Check that the ivset guid of the fromds matches the one from the
+	 * send stream. Older versions of the encryption code did not have
+	 * an ivset guid on the from dataset and did not send one in the
+	 * stream. For these streams we provide the
+	 * zfs_disable_ivset_guid_check tunable to allow these datasets to
+	 * be received with a generated ivset guid.
+	 */
+	if (fromds != NULL && !zfs_disable_ivset_guid_check) {
+		uint64_t from_ivset_guid = 0;
+		intval = 0;
+
+		(void) nvlist_lookup_uint64(nvl, "from_ivset_guid", &intval);
+		(void) zap_lookup(tx->tx_pool->dp_meta_objset,
+		    fromds->ds_object, DS_FIELD_IVSET_GUID,
+		    sizeof (from_ivset_guid), 1, &from_ivset_guid);
+
+		if (intval == 0 || from_ivset_guid == 0)
+			return (SET_ERROR(ZFS_ERR_FROM_IVSET_GUID_MISSING));
+
+		if (intval != from_ivset_guid)
+			return (SET_ERROR(ZFS_ERR_FROM_IVSET_GUID_MISMATCH));
+	}
+
 	return (0);
 }
 
@@ -2008,7 +2096,11 @@ dsl_crypto_recv_raw_objset_sync(dsl_dataset_t *ds, dmu_objset_type_t ostype,
 	VERIFY0(dmu_objset_from_ds(ds, &os));
 	mdn = DMU_META_DNODE(os);
 
-	/* fetch the values we need from the nvlist */
+	/*
+	 * Fetch the values we need from the nvlist. "to_ivset_guid" must
+	 * be set on the snapshot, which doesn't exist yet. The receive
+	 * code will take care of this for us later.
+	 */
 	compress = fnvlist_lookup_uint64(nvl, "mdn_compress");
 	checksum = fnvlist_lookup_uint64(nvl, "mdn_checksum");
 	nlevels = fnvlist_lookup_uint64(nvl, "mdn_nlevels");
@@ -2044,7 +2136,7 @@ dsl_crypto_recv_raw_objset_sync(dsl_dataset_t *ds, dmu_objset_type_t ostype,
 	mdn->dn_checksum = checksum;
 
 	rw_enter(&mdn->dn_struct_rwlock, RW_WRITER);
-	dnode_new_blkid(mdn, maxblkid, tx, B_FALSE);
+	dnode_new_blkid(mdn, maxblkid, tx, B_FALSE, B_TRUE);
 	rw_exit(&mdn->dn_struct_rwlock);
 
 	/*
@@ -2072,7 +2164,7 @@ dsl_crypto_recv_raw_key_check(dsl_dataset_t *ds, nvlist_t *nvl, dmu_tx_t *tx)
 	objset_t *mos = tx->tx_pool->dp_meta_objset;
 	uint8_t *buf = NULL;
 	uint_t len;
-	uint64_t intval, guid, version;
+	uint64_t intval, key_guid, version;
 	boolean_t is_passphrase = B_FALSE;
 
 	ASSERT(dsl_dataset_phys(ds)->ds_flags & DS_FLAG_INCONSISTENT);
@@ -2097,10 +2189,10 @@ dsl_crypto_recv_raw_key_check(dsl_dataset_t *ds, nvlist_t *nvl, dmu_tx_t *tx)
 	 */
 	if (ds->ds_dir->dd_crypto_obj != 0) {
 		ret = zap_lookup(mos, ds->ds_dir->dd_crypto_obj,
-		    DSL_CRYPTO_KEY_GUID, 8, 1, &guid);
+		    DSL_CRYPTO_KEY_GUID, 8, 1, &key_guid);
 		if (ret != 0)
 			return (ret);
-		if (intval != guid)
+		if (intval != key_guid)
 			return (SET_ERROR(EACCES));
 	}
 
@@ -2166,13 +2258,13 @@ dsl_crypto_recv_raw_key_sync(dsl_dataset_t *ds, nvlist_t *nvl, dmu_tx_t *tx)
 	uint_t len;
 	uint64_t rddobj, one = 1;
 	uint8_t *keydata, *hmac_keydata, *iv, *mac;
-	uint64_t crypt, guid, keyformat, iters, salt;
+	uint64_t crypt, key_guid, keyformat, iters, salt;
 	uint64_t version = ZIO_CRYPT_KEY_CURRENT_VERSION;
 	char *keylocation = "prompt";
 
 	/* lookup the values we need to create the DSL Crypto Key */
 	crypt = fnvlist_lookup_uint64(nvl, DSL_CRYPTO_KEY_CRYPTO_SUITE);
-	guid = fnvlist_lookup_uint64(nvl, DSL_CRYPTO_KEY_GUID);
+	key_guid = fnvlist_lookup_uint64(nvl, DSL_CRYPTO_KEY_GUID);
 	keyformat = fnvlist_lookup_uint64(nvl,
 	    zfs_prop_to_name(ZFS_PROP_KEYFORMAT));
 	iters = fnvlist_lookup_uint64(nvl,
@@ -2203,8 +2295,8 @@ dsl_crypto_recv_raw_key_sync(dsl_dataset_t *ds, nvlist_t *nvl, dmu_tx_t *tx)
 		    sizeof (uint64_t), 1, &version, tx));
 
 		dsl_dataset_activate_feature(ds->ds_object,
-		    SPA_FEATURE_ENCRYPTION, tx);
-		ds->ds_feature_inuse[SPA_FEATURE_ENCRYPTION] = B_TRUE;
+		    SPA_FEATURE_ENCRYPTION, (void *)B_TRUE, tx);
+		ds->ds_feature[SPA_FEATURE_ENCRYPTION] = (void *)B_TRUE;
 
 		/* save the dd_crypto_obj on disk */
 		VERIFY0(zap_add(mos, dd->dd_object, DD_FIELD_CRYPTO_KEY_OBJ,
@@ -2227,7 +2319,7 @@ dsl_crypto_recv_raw_key_sync(dsl_dataset_t *ds, nvlist_t *nvl, dmu_tx_t *tx)
 
 	/* sync the key data to the ZAP object on disk */
 	dsl_crypto_key_sync_impl(mos, dd->dd_crypto_obj, crypt,
-	    rddobj, guid, iv, mac, keydata, hmac_keydata, keyformat, salt,
+	    rddobj, key_guid, iv, mac, keydata, hmac_keydata, keyformat, salt,
 	    iters, tx);
 }
 
@@ -2236,17 +2328,24 @@ dsl_crypto_recv_key_check(void *arg, dmu_tx_t *tx)
 {
 	int ret;
 	dsl_crypto_recv_key_arg_t *dcrka = arg;
-	dsl_dataset_t *ds = NULL;
+	dsl_dataset_t *ds = NULL, *fromds = NULL;
 
 	ret = dsl_dataset_hold_obj(tx->tx_pool, dcrka->dcrka_dsobj,
 	    FTAG, &ds);
 	if (ret != 0)
-		goto error;
+		goto out;
 
-	ret = dsl_crypto_recv_raw_objset_check(ds,
+	if (dcrka->dcrka_fromobj != 0) {
+		ret = dsl_dataset_hold_obj(tx->tx_pool, dcrka->dcrka_fromobj,
+		    FTAG, &fromds);
+		if (ret != 0)
+			goto out;
+	}
+
+	ret = dsl_crypto_recv_raw_objset_check(ds, fromds,
 	    dcrka->dcrka_ostype, dcrka->dcrka_nvl, tx);
 	if (ret != 0)
-		goto error;
+		goto out;
 
 	/*
 	 * We run this check even if we won't be doing this part of
@@ -2255,14 +2354,13 @@ dsl_crypto_recv_key_check(void *arg, dmu_tx_t *tx)
 	 */
 	ret = dsl_crypto_recv_raw_key_check(ds, dcrka->dcrka_nvl, tx);
 	if (ret != 0)
-		goto error;
+		goto out;
 
-	dsl_dataset_rele(ds, FTAG);
-	return (0);
-
-error:
+out:
 	if (ds != NULL)
 		dsl_dataset_rele(ds, FTAG);
+	if (fromds != NULL)
+		dsl_dataset_rele(fromds, FTAG);
 	return (ret);
 }
 
@@ -2287,12 +2385,13 @@ dsl_crypto_recv_key_sync(void *arg, dmu_tx_t *tx)
  * without wrapping it.
  */
 int
-dsl_crypto_recv_raw(const char *poolname, uint64_t dsobj,
+dsl_crypto_recv_raw(const char *poolname, uint64_t dsobj, uint64_t fromobj,
     dmu_objset_type_t ostype, nvlist_t *nvl, boolean_t do_key)
 {
 	dsl_crypto_recv_key_arg_t dcrka;
 
 	dcrka.dcrka_dsobj = dsobj;
+	dcrka.dcrka_fromobj = fromobj;
 	dcrka.dcrka_ostype = ostype;
 	dcrka.dcrka_nvl = nvl;
 	dcrka.dcrka_do_key = do_key;
@@ -2302,7 +2401,8 @@ dsl_crypto_recv_raw(const char *poolname, uint64_t dsobj,
 }
 
 int
-dsl_crypto_populate_key_nvlist(dsl_dataset_t *ds, nvlist_t **nvl_out)
+dsl_crypto_populate_key_nvlist(dsl_dataset_t *ds, uint64_t from_ivset_guid,
+    nvlist_t **nvl_out)
 {
 	int ret;
 	objset_t *os;
@@ -2313,8 +2413,9 @@ dsl_crypto_populate_key_nvlist(dsl_dataset_t *ds, nvlist_t **nvl_out)
 	dsl_dir_t *rdd = NULL;
 	dsl_pool_t *dp = ds->ds_dir->dd_pool;
 	objset_t *mos = dp->dp_meta_objset;
-	uint64_t crypt = 0, guid = 0, format = 0;
+	uint64_t crypt = 0, key_guid = 0, format = 0;
 	uint64_t iters = 0, salt = 0, version = 0;
+	uint64_t to_ivset_guid = 0;
 	uint8_t raw_keydata[MASTER_KEY_MAX_LEN];
 	uint8_t raw_hmac_keydata[SHA512_HMAC_KEYLEN];
 	uint8_t iv[WRAPPING_IV_LEN];
@@ -2335,7 +2436,7 @@ dsl_crypto_populate_key_nvlist(dsl_dataset_t *ds, nvlist_t **nvl_out)
 	if (ret != 0)
 		goto error;
 
-	ret = zap_lookup(mos, dckobj, DSL_CRYPTO_KEY_GUID, 8, 1, &guid);
+	ret = zap_lookup(mos, dckobj, DSL_CRYPTO_KEY_GUID, 8, 1, &key_guid);
 	if (ret != 0)
 		goto error;
 
@@ -2358,6 +2459,12 @@ dsl_crypto_populate_key_nvlist(dsl_dataset_t *ds, nvlist_t **nvl_out)
 	    mac);
 	if (ret != 0)
 		goto error;
+
+	/* see zfs_disable_ivset_guid_check tunable for errata info */
+	ret = zap_lookup(mos, ds->ds_object, DS_FIELD_IVSET_GUID, 8, 1,
+	    &to_ivset_guid);
+	if (ret != 0)
+		ASSERT3U(dp->dp_spa->spa_errata, !=, 0);
 
 	/*
 	 * We don't support raw sends of legacy on-disk formats. See the
@@ -2408,7 +2515,7 @@ dsl_crypto_populate_key_nvlist(dsl_dataset_t *ds, nvlist_t **nvl_out)
 	dsl_pool_config_exit(dp, FTAG);
 
 	fnvlist_add_uint64(nvl, DSL_CRYPTO_KEY_CRYPTO_SUITE, crypt);
-	fnvlist_add_uint64(nvl, DSL_CRYPTO_KEY_GUID, guid);
+	fnvlist_add_uint64(nvl, DSL_CRYPTO_KEY_GUID, key_guid);
 	fnvlist_add_uint64(nvl, DSL_CRYPTO_KEY_VERSION, version);
 	VERIFY0(nvlist_add_uint8_array(nvl, DSL_CRYPTO_KEY_MASTER_KEY,
 	    raw_keydata, MASTER_KEY_MAX_LEN));
@@ -2430,6 +2537,8 @@ dsl_crypto_populate_key_nvlist(dsl_dataset_t *ds, nvlist_t **nvl_out)
 	fnvlist_add_uint64(nvl, "mdn_indblkshift", mdn->dn_indblkshift);
 	fnvlist_add_uint64(nvl, "mdn_nblkptr", mdn->dn_nblkptr);
 	fnvlist_add_uint64(nvl, "mdn_maxblkid", mdn->dn_maxblkid);
+	fnvlist_add_uint64(nvl, "to_ivset_guid", to_ivset_guid);
+	fnvlist_add_uint64(nvl, "from_ivset_guid", from_ivset_guid);
 
 	*nvl_out = nvl;
 	return (0);
@@ -2539,6 +2648,10 @@ dsl_dataset_crypt_stats(dsl_dataset_t *ds, nvlist_t *nv)
 	if (zap_lookup(dd->dd_pool->dp_meta_objset, dd->dd_crypto_obj,
 	    zfs_prop_to_name(ZFS_PROP_PBKDF2_ITERS), 8, 1, &intval) == 0) {
 		dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_PBKDF2_ITERS, intval);
+	}
+	if (zap_lookup(dd->dd_pool->dp_meta_objset, ds->ds_object,
+	    DS_FIELD_IVSET_GUID, 8, 1, &intval) == 0) {
+		dsl_prop_nvlist_add_uint64(nv, ZFS_PROP_IVSET_GUID, intval);
 	}
 
 	if (dsl_dir_get_encryption_root_ddobj(dd, &intval) == 0) {
@@ -2774,3 +2887,9 @@ error:
 
 	return (ret);
 }
+
+#if defined(_KERNEL)
+module_param(zfs_disable_ivset_guid_check, int, 0644);
+MODULE_PARM_DESC(zfs_disable_ivset_guid_check,
+	"Set to allow raw receives without IVset guids");
+#endif

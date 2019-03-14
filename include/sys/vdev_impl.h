@@ -21,6 +21,7 @@
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2011, 2018 by Delphix. All rights reserved.
+ * Copyright (c) 2017, Intel Corporation.
  */
 
 #ifndef _SYS_VDEV_IMPL_H
@@ -81,6 +82,12 @@ typedef void	vdev_remap_cb_t(uint64_t inner_offset, vdev_t *vd,
     uint64_t offset, uint64_t size, void *arg);
 typedef void	vdev_remap_func_t(vdev_t *vd, uint64_t offset, uint64_t size,
     vdev_remap_cb_t callback, void *arg);
+/*
+ * Given a target vdev, translates the logical range "in" to the physical
+ * range "res"
+ */
+typedef void vdev_xlation_func_t(vdev_t *cvd, const range_seg_t *in,
+    range_seg_t *res);
 
 typedef const struct vdev_ops {
 	vdev_open_func_t		*vdev_op_open;
@@ -93,6 +100,11 @@ typedef const struct vdev_ops {
 	vdev_hold_func_t		*vdev_op_hold;
 	vdev_rele_func_t		*vdev_op_rele;
 	vdev_remap_func_t		*vdev_op_remap;
+	/*
+	 * For translating ranges from non-leaf vdevs (e.g. raidz) to leaves.
+	 * Used when initializing vdevs. Isn't used by leaf ops.
+	 */
+	vdev_xlation_func_t		*vdev_op_xlate;
 	char				vdev_op_type[16];
 	boolean_t			vdev_op_leaf;
 } vdev_ops_t;
@@ -139,6 +151,14 @@ struct vdev_queue {
 	zio_t		vq_io_search; /* used as local for stack reduction */
 	kmutex_t	vq_lock;
 };
+
+typedef enum vdev_alloc_bias {
+	VDEV_BIAS_NONE,
+	VDEV_BIAS_LOG,		/* dedicated to ZIL data (SLOG) */
+	VDEV_BIAS_SPECIAL,	/* dedicated to ddt, metadata, and small blks */
+	VDEV_BIAS_DEDUP		/* dedicated to dedup metadata */
+} vdev_alloc_bias_t;
+
 
 /*
  * On-disk indirect vdev state.
@@ -234,11 +254,30 @@ struct vdev {
 	uint64_t	vdev_islog;	/* is an intent log device	*/
 	uint64_t	vdev_removing;	/* device is being removed?	*/
 	boolean_t	vdev_ishole;	/* is a hole in the namespace	*/
-	kmutex_t	vdev_queue_lock; /* protects vdev_queue_depth	*/
 	uint64_t	vdev_top_zap;
+	vdev_alloc_bias_t vdev_alloc_bias; /* metaslab allocation bias	*/
 
 	/* pool checkpoint related */
 	space_map_t	*vdev_checkpoint_sm;	/* contains reserved blocks */
+
+	boolean_t	vdev_initialize_exit_wanted;
+	vdev_initializing_state_t	vdev_initialize_state;
+	list_node_t	vdev_initialize_node;
+	kthread_t	*vdev_initialize_thread;
+	/* Protects vdev_initialize_thread and vdev_initialize_state. */
+	kmutex_t	vdev_initialize_lock;
+	kcondvar_t	vdev_initialize_cv;
+	uint64_t	vdev_initialize_offset[TXG_SIZE];
+	uint64_t	vdev_initialize_last_offset;
+	range_tree_t	*vdev_initialize_tree;	/* valid while initializing */
+	uint64_t	vdev_initialize_bytes_est;
+	uint64_t	vdev_initialize_bytes_done;
+	time_t		vdev_initialize_action_time;	/* start and end time */
+
+	/* for limiting outstanding I/Os */
+	kmutex_t	vdev_initialize_io_lock;
+	kcondvar_t	vdev_initialize_io_cv;
+	uint64_t	vdev_initialize_inflight;
 
 	/*
 	 * Values stored in the config for an indirect or removing vdev.
@@ -273,16 +312,6 @@ struct vdev {
 	kmutex_t	vdev_obsolete_lock;
 	range_tree_t	*vdev_obsolete_segments;
 	space_map_t	*vdev_obsolete_sm;
-
-	/*
-	 * The queue depth parameters determine how many async writes are
-	 * still pending (i.e. allocated by net yet issued to disk) per
-	 * top-level (vdev_async_write_queue_depth) and the maximum allowed
-	 * (vdev_max_async_write_queue_depth). These values only apply to
-	 * top-level vdevs.
-	 */
-	uint64_t	vdev_async_write_queue_depth;
-	uint64_t	vdev_max_async_write_queue_depth;
 
 	/*
 	 * Protects the vdev_scan_io_queue field itself as well as the
@@ -325,6 +354,7 @@ struct vdev {
 	boolean_t	vdev_isspare;	/* was a hot spare		*/
 	boolean_t	vdev_isl2cache;	/* was a l2cache device		*/
 	boolean_t	vdev_copy_uberblocks;  /* post expand copy uberblocks */
+	boolean_t	vdev_resilver_deferred;  /* resilver deferred */
 	vdev_queue_t	vdev_queue;	/* I/O deadline schedule queue	*/
 	vdev_cache_t	vdev_cache;	/* physical block cache		*/
 	spa_aux_vdev_t	*vdev_aux;	/* for l2cache and spares vdevs	*/
@@ -333,6 +363,8 @@ struct vdev {
 	uint64_t	vdev_leaf_zap;
 	hrtime_t	vdev_mmp_pending; /* 0 if write finished	*/
 	uint64_t	vdev_mmp_kstat_id;	/* to find kstat entry */
+	uint64_t	vdev_expansion_time;	/* vdev's last expansion time */
+	list_node_t	vdev_leaf_node;		/* leaf vdev list */
 
 	/*
 	 * For DTrace to work in userland (libzpool) context, these fields must
@@ -466,6 +498,8 @@ extern vdev_ops_t vdev_indirect_ops;
 /*
  * Common size functions
  */
+extern void vdev_default_xlate(vdev_t *vd, const range_seg_t *in,
+    range_seg_t *out);
 extern uint64_t vdev_default_asize(vdev_t *vd, uint64_t psize);
 extern uint64_t vdev_get_min_asize(vdev_t *vd);
 extern void vdev_set_min_asize(vdev_t *vd);
@@ -483,13 +517,13 @@ extern int zfs_vdev_cache_size;
 extern void vdev_indirect_sync_obsolete(vdev_t *vd, dmu_tx_t *tx);
 extern boolean_t vdev_indirect_should_condense(vdev_t *vd);
 extern void spa_condense_indirect_start_sync(vdev_t *vd, dmu_tx_t *tx);
-extern int vdev_obsolete_sm_object(vdev_t *vd);
-extern boolean_t vdev_obsolete_counts_are_precise(vdev_t *vd);
+extern int vdev_obsolete_sm_object(vdev_t *vd, uint64_t *sm_obj);
+extern int vdev_obsolete_counts_are_precise(vdev_t *vd, boolean_t *are_precise);
 
 /*
  * Other miscellaneous functions
  */
-int vdev_checkpoint_sm_object(vdev_t *vd);
+int vdev_checkpoint_sm_object(vdev_t *vd, uint64_t *sm_obj);
 
 #ifdef	__cplusplus
 }

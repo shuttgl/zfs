@@ -31,7 +31,7 @@
 #include <sys/dmu.h>
 #include <sys/dmu_tx.h>
 #include <sys/dmu_objset.h>
-#include <sys/dmu_send.h>
+#include <sys/dmu_recv.h>
 #include <sys/dsl_dataset.h>
 #include <sys/spa.h>
 #include <sys/range_tree.h>
@@ -384,12 +384,7 @@ dnode_sync_free_range_impl(dnode_t *dn, uint64_t blkid, uint64_t nblks,
 		}
 	}
 
-	/*
-	 * Do not truncate the maxblkid if we are performing a raw
-	 * receive. The raw receive sets the mablkid manually and
-	 * must not be overriden.
-	 */
-	if (trunc && !dn->dn_objset->os_raw_receive) {
+	if (trunc) {
 		ASSERTV(uint64_t off);
 		dn->dn_phys->dn_maxblkid = blkid == 0 ? 0 : blkid - 1;
 
@@ -441,7 +436,7 @@ dnode_evict_dbufs(dnode_t *dn)
 
 		mutex_enter(&db->db_mtx);
 		if (db->db_state != DB_EVICTING &&
-		    refcount_is_zero(&db->db_holds)) {
+		    zfs_refcount_is_zero(&db->db_holds)) {
 			db_marker->db_level = db->db_level;
 			db_marker->db_blkid = db->db_blkid;
 			db_marker->db_state = DB_SEARCH;
@@ -483,7 +478,7 @@ dnode_evict_bonus(dnode_t *dn)
 {
 	rw_enter(&dn->dn_struct_rwlock, RW_WRITER);
 	if (dn->dn_bonus != NULL) {
-		if (refcount_is_zero(&dn->dn_bonus->db_holds)) {
+		if (zfs_refcount_is_zero(&dn->dn_bonus->db_holds)) {
 			mutex_enter(&dn->dn_bonus->db_mtx);
 			dbuf_destroy(dn->dn_bonus);
 			dn->dn_bonus = NULL;
@@ -549,7 +544,7 @@ dnode_sync_free(dnode_t *dn, dmu_tx_t *tx)
 	 * zfs_obj_to_path() also depends on this being
 	 * commented out.
 	 *
-	 * ASSERT3U(refcount_count(&dn->dn_holds), ==, 1);
+	 * ASSERT3U(zfs_refcount_count(&dn->dn_holds), ==, 1);
 	 */
 
 	/* Undirty next bits */
@@ -753,8 +748,8 @@ dnode_sync(dnode_t *dn, dmu_tx_t *tx)
 	if (dn->dn_num_slots > DNODE_MIN_SLOTS) {
 		dsl_dataset_t *ds = dn->dn_objset->os_dsl_dataset;
 		mutex_enter(&ds->ds_lock);
-		ds->ds_feature_activation_needed[SPA_FEATURE_LARGE_DNODE] =
-		    B_TRUE;
+		ds->ds_feature_activation[SPA_FEATURE_LARGE_DNODE] =
+		    (void *)B_TRUE;
 		mutex_exit(&ds->ds_lock);
 	}
 
@@ -765,11 +760,13 @@ dnode_sync(dnode_t *dn, dmu_tx_t *tx)
 
 	/*
 	 * This must be done after dnode_sync_free_range()
-	 * and dnode_increase_indirection().
+	 * and dnode_increase_indirection(). See dnode_new_blkid()
+	 * for an explanation of the high bit being set.
 	 */
 	if (dn->dn_next_maxblkid[txgoff]) {
 		mutex_enter(&dn->dn_mtx);
-		dnp->dn_maxblkid = dn->dn_next_maxblkid[txgoff];
+		dnp->dn_maxblkid =
+		    dn->dn_next_maxblkid[txgoff] & ~DMU_NEXT_MAXBLKID_SET;
 		dn->dn_next_maxblkid[txgoff] = 0;
 		mutex_exit(&dn->dn_mtx);
 	}

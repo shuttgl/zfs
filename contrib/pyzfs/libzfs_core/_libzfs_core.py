@@ -26,6 +26,7 @@ increased convenience.  Output parameters are not used and return values
 are directly returned.  Error conditions are signalled by exceptions
 rather than by integer error codes.
 """
+from __future__ import absolute_import, division, print_function
 
 import errno
 import functools
@@ -112,7 +113,7 @@ def lzc_create(name, ds_type='zfs', props=None, key=None):
     if props is None:
         props = {}
     if key is None:
-        key = bytes("")
+        key = b""
     else:
         key = bytes(key)
     if ds_type == 'zfs':
@@ -485,8 +486,8 @@ def lzc_hold(holds, fd=None):
     errors.lzc_hold_translate_errors(ret, errlist, holds, fd)
     # If there is no error (no exception raised by _handleErrList), but errlist
     # is not empty, then it contains missing snapshots.
-    assert all(x == errno.ENOENT for x in errlist.itervalues())
-    return errlist.keys()
+    assert all(errlist[x] == errno.ENOENT for x in errlist)
+    return list(errlist.keys())
 
 
 def lzc_release(holds):
@@ -521,7 +522,8 @@ def lzc_release(holds):
     '''
     errlist = {}
     holds_dict = {}
-    for snap, hold_list in holds.iteritems():
+    for snap in holds:
+        hold_list = holds[snap]
         if not isinstance(hold_list, list):
             raise TypeError('holds must be in a list')
         holds_dict[snap] = {hold: None for hold in hold_list}
@@ -531,8 +533,8 @@ def lzc_release(holds):
     errors.lzc_release_translate_errors(ret, errlist, holds)
     # If there is no error (no exception raised by _handleErrList), but errlist
     # is not empty, then it contains missing snapshots and tags.
-    assert all(x == errno.ENOENT for x in errlist.itervalues())
-    return errlist.keys()
+    assert all(errlist[x] == errno.ENOENT for x in errlist)
+    return list(errlist.keys())
 
 
 def lzc_get_holds(snapname):
@@ -752,6 +754,8 @@ def lzc_receive(snapname, fd, force=False, raw=False, origin=None, props=None):
         supported on this side.
     :raises NameInvalid: if the name of either snapshot is invalid.
     :raises NameTooLong: if the name of either snapshot is too long.
+    :raises WrongParent: if the parent dataset of the received destination is
+        not a filesystem (e.g. ZVOL)
 
     .. note::
         The ``origin`` is ignored if the actual stream is an incremental stream
@@ -846,7 +850,7 @@ def lzc_change_key(fsname, crypt_cmd, props=None, key=None):
     if props is None:
         props = {}
     if key is None:
-        key = bytes("")
+        key = b""
     else:
         key = bytes(key)
     cmd = {
@@ -929,13 +933,13 @@ def lzc_channel_program(
         error.
     '''
     output = {}
-    params_nv = nvlist_in({"argv": params})
+    params_nv = nvlist_in({b"argv": params})
     with nvlist_out(output) as outnvl:
         ret = _lib.lzc_channel_program(
             poolname, program, instrlimit, memlimit, params_nv, outnvl)
     errors.lzc_channel_program_translate_error(
-        ret, poolname, output.get("error"))
-    return output.get("return")
+        ret, poolname, output.get(b"error"))
+    return output.get(b"return")
 
 
 def lzc_channel_program_nosync(
@@ -974,13 +978,13 @@ def lzc_channel_program_nosync(
         error.
     '''
     output = {}
-    params_nv = nvlist_in({"argv": params})
+    params_nv = nvlist_in({b"argv": params})
     with nvlist_out(output) as outnvl:
         ret = _lib.lzc_channel_program_nosync(
             poolname, program, instrlimit, memlimit, params_nv, outnvl)
     errors.lzc_channel_program_translate_error(
-        ret, poolname, output.get("error"))
-    return output.get("return")
+        ret, poolname, output.get(b"error"))
+    return output.get(b"return")
 
 
 def lzc_receive_resumable(
@@ -1404,7 +1408,7 @@ def lzc_receive_with_cmdprops(
     if cmdprops is None:
         cmdprops = {}
     if key is None:
-        key = bytes("")
+        key = b""
     else:
         key = bytes(key)
 
@@ -1509,7 +1513,7 @@ def lzc_sync(poolname, force=False):
         `innvl` has been replaced by the `force` boolean and `outnvl` has been
         conveniently removed since it's not used.
     '''
-    innvl = nvlist_in({"force": force})
+    innvl = nvlist_in({b"force": force})
     with nvlist_out({}) as outnvl:
         ret = _lib.lzc_sync(poolname, innvl, outnvl)
     errors.lzc_sync_translate_error(ret, poolname)
@@ -1605,7 +1609,6 @@ def lzc_pool_checkpoint_discard(name):
     errors.lzc_pool_checkpoint_discard_translate_error(ret, name)
 
 
-@_uncommitted()
 def lzc_rename(source, target):
     '''
     Rename the ZFS dataset.
@@ -1620,13 +1623,14 @@ def lzc_rename(source, target):
     :raises FilesystemNotFound: if the target's parent does not exist.
     :raises FilesystemExists: if the target already exists.
     :raises PoolsDiffer: if the source and target belong to different pools.
+    :raises WrongParent: if the "new" parent dataset is not a filesystem
+        (e.g. ZVOL)
     '''
-    ret = _lib.lzc_rename(source, target, _ffi.NULL, _ffi.NULL)
+    ret = _lib.lzc_rename(source, target)
     errors.lzc_rename_translate_error(ret, source, target)
 
 
-@_uncommitted()
-def lzc_destroy_one(name):
+def lzc_destroy(name):
     '''
     Destroy the ZFS dataset.
 
@@ -1635,14 +1639,8 @@ def lzc_destroy_one(name):
     :raises NameTooLong: if the dataset name is too long.
     :raises FilesystemNotFound: if the dataset does not exist.
     '''
-    ret = _lib.lzc_destroy_one(name, _ffi.NULL)
+    ret = _lib.lzc_destroy(name)
     errors.lzc_destroy_translate_error(ret, name)
-
-
-# As the extended API is not committed yet, the names of the new interfaces
-# are not settled down yet.
-# lzc_destroy() might make more sense as we do not have lzc_create_one().
-lzc_destroy = lzc_destroy_one
 
 
 @_uncommitted()
@@ -1881,9 +1879,9 @@ def lzc_get_props(name):
         mountpoint_val = '/' + name
     else:
         mountpoint_val = None
-    result = {k: v['value'] for k, v in result.iteritems()}
+    result = {k: result[k]['value'] for k in result}
     if 'clones' in result:
-        result['clones'] = result['clones'].keys()
+        result['clones'] = list(result['clones'].keys())
     if mountpoint_val is not None:
         result['mountpoint'] = mountpoint_val
     return result
